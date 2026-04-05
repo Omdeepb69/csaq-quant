@@ -1,98 +1,95 @@
-# csq-quant — Causal Salience Quantization
+# CSAQ: Causal Salience-Aware Quantization
 
-[![PyPI](https://img.shields.io/pypi/v/csq-quant)](https://pypi.org/project/csq-quant/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![PyPI version](https://badge.fury.io/py/csaq-quant.svg)](https://badge.fury.io/py/csaq-quant)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**CSQ** is a post-training quantization method for large language models that uses gradient×activation causal importance scoring to identify which weights truly matter — then protects them from aggressive quantization.
+**Causal Salience-Aware Quantization (CSAQ)** is a high-performance LLM weight quantization engine designed to hit perfectly defined fractional bit-budgets (e.g., exactly 4.0 bits/weight) by utilizing mixed-precision formats. Unlike magnitude-based proxies like AWQ or GPTQ, CSAQ uses first-order Taylor approximations to measure actual *causal salience* combined with advanced *co-activation interaction graphs*.
 
-> **Paper:** *CSQ: Closing the Perplexity Gap in 4-Bit LLM Quantization via Causal Salience Scoring and Co-Activation Graph Protection*
+## Features
 
-## Why CSQ?
+- **Multi-Bit Mixed Precision**: Replaces static quantization settings. Automatically distributes available bit thresholds (`1, 2, 4, 8, 16`) based heavily on impact, significantly minimizing degradation on critical model pathways.
+- **Top-K Jaccard Co-Activation Graphs**: Discovers sets of weights that commonly fire together using "Atomic Cliques".
+- **Shared-Scale Architecture**: Assigns low-precision bits to trailing follower weights by recycling the Quantization Scaling Factors ($S$) and Zero-Points ($Z$) of the clique's high-salience *Leader*, aggressively compressing parameters without losing scale context.
+- **Constant Memory Footprint**: Tracks Jaccard activation sparsification using an online bit-vector union/intersection accumulator, avoiding disastrous Out-Of-Memory (OOM) errors during calibration.
 
-Existing methods like AWQ use **activation magnitude** as a proxy for weight importance. We show this proxy agrees with true causal salience on only **~20% of top-5% critical weights** — meaning AWQ aggressively quantizes 80% of the weights that actually matter most. CSQ fixes this.
+## Installation
 
-| Method        | Avg bits | WikiText-2 PPL ↓ | GSM8K ↑ |
-|---------------|----------|------------------|---------|
-| FP32 baseline | 32.00    | —                | —       |
-| RTN 4-bit     | 4.00     | worst            | worst   |
-| AWQ-style     | 4.12     | better           | better  |
-| **CSQ (ours)**| **4.00** | **best**         | **best**|
-
-*Results on LLaMA-3.2-1B. CSQ matches AWQ's bit budget while outperforming on perplexity and reasoning tasks.*
-
-## Install
+Install using pip:
 
 ```bash
-pip install csq-quant
+pip install csaq-quant
 ```
 
-## Usage
+## Quick Start
+
+### 1. Python API
+
+You can programmatically apply CSAQ using the core export `quantize` and managing constraints with `CSAQConfig`:
 
 ```python
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from csq import quantize, build_calibration_data
+from csaq import quantize, CSAQConfig, build_calibration_data
 
-# Load your model
-model     = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+# 1. Load your standard HF LLM
+model_id = "Qwen/Qwen1.5-0.5B"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, device_map="cpu")
 
-# Build calibration data (64 samples recommended)
-calib_data = build_calibration_data(tokenizer, n=64, device="cuda")
+# 2. Extract representative calibration data
+calib_data = build_calibration_data(tokenizer, n=32, seq_len=128)
 
-# Quantize — that's it
-model, info = quantize(model, calib_data, target_bits=4.0)
+# 3. Configure fractional Bit-Budget and allowed bits (e.g., target exactly 4 bits on average)
+config = CSAQConfig(
+    target_bits=4.0, 
+    bit_options=[1, 2, 4, 8, 16],
+    clique_threshold=0.85
+)
 
-print(f"Avg bits: {info['avg_bits']:.3f}")
-# → Avg bits: 4.001
+# 4. Fire the Quantization Pipeline
+quantized_model, info = quantize(
+    model=model, 
+    calib_data=calib_data, 
+    config=config, 
+    verbose=True
+)
 
-# Model is a drop-in replacement — use exactly as before
-outputs = model.generate(input_ids, max_new_tokens=100)
+# Optional: Generate metrics report and export to safetensors
+from csaq.utils import generate_csaq_report, export_csaq_model
+generate_csaq_report(info, save_path="./CSAQ_Report.json")
+export_csaq_model(quantized_model, config, info["budget"], "./csaq_output")
 ```
 
-## How it works
+### 2. Command Line Interface (CLI)
 
-CSQ runs in three stages, all offline (done once before deployment):
+CSAQ includes a seamless CLI for quantizing models directly from the terminal without writing a single script.
 
-**Stage 1 — Causal salience profiling**
-Runs N forward+backward passes on a calibration set. For each weight, computes `|grad × weight|` — a first-order Taylor approximation of the loss change from zeroing that weight. This is a *true causal measure*, not a proxy.
-
-**Stage 2 — Bit budget solver**
-Binary searches over salience thresholds to find the fp16/int8/int4 split that achieves *exactly* your target bit-width (e.g. 4.000 bits). This is what makes CSQ's results directly comparable to AWQ and GPTQ at matched memory.
-
-**Stage 3 — Tiered quantization**
-Applies the solved tiers per weight element:
-- Top ~5% by causal salience → keep fp16 (zero quantization loss)
-- Next ~20% → INT8 (minimal loss)
-- Bottom ~75% → INT4 (aggressive, but on weights that don't matter)
-
-## Advanced usage
-
-```python
-from csq import compute_causal_salience, solve_bit_budget, apply_csq
-
-# Run stages individually for more control
-salience = compute_causal_salience(model, calib_data, verbose=True)
-budget   = solve_bit_budget(salience, target_bits=4.0)
-model, tier_stats = apply_csq(model, salience, budget)
-
-# Inspect what happened
-print(f"fp16 weights: {tier_stats['fp16']:,}")
-print(f"int8 weights: {tier_stats['int8']:,}")
-print(f"int4 weights: {tier_stats['int4']:,}")
+**Basic Usage:**
+```bash
+python -m csaq \
+  --model_path Qwen/Qwen1.5-0.5B \
+  --wbits 4.0 \
+  --options 1,2,4,8,16 \
+  --save_path ./csaq_export
 ```
 
-## Citation
+**CLI Arguments Breakdown:**
+- `--model_path`: **(Required)** The path to a local Hugging Face model directory or a Hub repository ID (e.g., `meta-llama/Llama-3-8B`).
+- `--wbits`: **(Optional)** The target *average* bit-width per weight across the entire network. Defaults to `4.0`.
+- `--options`: **(Optional)** Comma-separated list of discrete bit formats the constraint solver is allowed to assign. Defaults to `1,2,4,8,16`. High-salience cliques get higher bits.
+- `--save_path`: **(Required)** The local directory where the `safetensors` model, config modifications, and `CSAQ_Report.json` will be saved.
 
-```bibtex
-@article{borkar2026csq,
-  title   = {CSQ: Closing the Perplexity Gap in 4-Bit LLM Quantization
-             via Causal Salience Scoring and Co-Activation Graph Protection},
-  author  = {Borkar, Omdeep},
-  journal = {arXiv preprint},
-  year    = {2026}
-}
+**Example for deep quantization:**
+```bash
+python -m csaq --model_path meta-llama/Llama-3-8B --wbits 2.5 --options 1,2,4 --save_path ./llama3-2.5bit
 ```
 
+### Advanced Details
+
+**Early Stopping Heuristic**: The profiling phase evaluates the Spearman rank correlation of accumulated salience gradients over calibration batches. CSAQ will automatically stop processing subsets once weights theoretically stabilize, saving enormous amounts of compute.
+
+**Outputs**: The engine spits out a `CSAQ_Report.json` providing metric insights regarding constraint mapping, Bit-Distribution Histograms, Pareto Efficiency estimation, and Clique generation sizes. 
+ 
 ## License
 
-MIT
+MIT License
