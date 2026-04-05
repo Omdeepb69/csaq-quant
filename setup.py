@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="csaq-quant",
-    version="0.1.0",
+    version="0.1.4",
     author="Omdeep Borkar",
     author_email="omdeepborkar@gmail.com",
     description=(
@@ -32,6 +32,8 @@ setup(
         "transformers>=4.35.0",
         "numpy>=1.24.0",
         "datasets>=2.14.0",
+        "tqdm>=4.66.0",
+        "psutil>=5.9.0",
     ],
     extras_require={
         "dev": ["pytest", "black", "isort"],

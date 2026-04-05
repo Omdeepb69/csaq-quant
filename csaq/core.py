@@ -16,24 +16,24 @@ class CausalProfiler:
         self.salience = {}
         self.intersection = {}
         self.freqs = {}
+        self.history = {}
         self.hooks = []
         self.modules = {}
 
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
-                # We only profile weights that require grad
+                # Only profile weights that require grad and avoid enormous unquantized heads
                 if getattr(module, "weight", None) is not None and module.weight.requires_grad:
+                    if "lm_head" in name or "embed" in name:
+                        continue
+                        
                     self.modules[name] = module
                     self.salience[name] = torch.zeros_like(module.weight.data, device="cpu")
-                    
-                    n_out = module.weight.shape[0]
-                    self.intersection[name] = torch.zeros((n_out, n_out), dtype=torch.long, device="cpu")
-                    self.freqs[name] = torch.zeros((n_out,), dtype=torch.long, device="cpu")
+                    self.history[name] = []
                     self._register_hook(name, module)
     
     def _register_hook(self, name, module):
         def forward_hook(m, inp, out):
-            # out: (batch, seq, out_features)
             with torch.no_grad():
                 o = out.detach().view(-1, out.shape[-1]).cpu() # (B*seq, n_out)
                 # Top 10% Sparsification
@@ -44,12 +44,8 @@ class CausalProfiler:
                     thresholds = o.abs().topk(k, dim=1).values[:, -1:]
                     mask = o.abs() >= thresholds
                 
-                # Active mask is (N, n_out)
-                mask = mask.to(torch.float16)  # float16 for fast matmul
-                intersect = torch.matmul(mask.t(), mask).to(torch.long)
-                
-                self.intersection[name] += intersect
-                self.freqs[name] += mask.sum(dim=0).to(torch.long)
+                # Append boolean active mask (constant small memory footprint across L and V)
+                self.history[name].append(mask)
                 
         self.hooks.append(module.register_forward_hook(forward_hook))
 
@@ -60,7 +56,13 @@ class CausalProfiler:
         prev_salience_ranks = None
         n_samples = len(calib_data)
 
-        for i, batch in enumerate(calib_data):
+        try:
+            from tqdm import tqdm
+            data_iter = tqdm(calib_data, desc="[CSAQ] Profiling Causal Salience", disable=not verbose)
+        except ImportError:
+            data_iter = calib_data
+
+        for i, batch in enumerate(data_iter):
             labels = batch.get("labels", batch.get("input_ids"))
             out = self.model(**{k: v for k, v in batch.items()
                                 if k in ("input_ids", "attention_mask", "labels")},
@@ -76,26 +78,28 @@ class CausalProfiler:
 
             # Spearman Early Stopping every 8 samples
             if (i + 1) % 8 == 0 or (i + 1) == n_samples:
-                # Concatenate all salience to compute global rank
+                # Concatenate all salience to compute proxy
                 all_sal = torch.cat([self.salience[n].flatten() for n in self.modules.keys()])
-                # Sort to get ranks
-                ranks = all_sal.argsort().argsort() # rank of each element
+                
+                # Sample randomly to calculate the Spearman Rank 
+                # Scales to RAM to prevent argsorts from consuming massive memory chunks dynamically.
+                if not hasattr(self, "eval_idx"):
+                     eval_size = 100000
+                     if getattr(self.config, "auto_scale_memory", True):
+                         import psutil
+                         if psutil.virtual_memory().available < 8 * 1024**3:
+                             eval_size = 25000
+                     self.eval_idx = torch.randperm(all_sal.numel())[:eval_size]
+                     
+                sub_sal = all_sal[self.eval_idx]
+                ranks = sub_sal.argsort().argsort() # rank of sub-sampled elements
+                del all_sal
                 
                 if prev_salience_ranks is not None:
-                    # Approximation of Spearman rho avoiding large float64 sums
-                    # Since n is huge (~Billions), calculating full Pearson on ranks can be slow
-                    # We compute exact formula: 1 - 6 sum(d^2) / (n(n^2 - 1))
+                    # Approximation of Spearman rho
                     n = float(ranks.numel())
-                    # To avoid overflow, sample if too large
-                    if n > 100000:
-                        idx = torch.randperm(int(n))[:100000]
-                        d = (ranks[idx].float() - prev_salience_ranks[idx].float())
-                        n_sub = 100000.0
-                    else:
-                        d = (ranks.float() - prev_salience_ranks.float())
-                        n_sub = n
-                        
-                    rho = 1.0 - (6.0 * (d ** 2).sum().item()) / (n_sub * (n_sub ** 2 - 1))
+                    d = (ranks.float() - prev_salience_ranks.float())
+                    rho = 1.0 - (6.0 * (d ** 2).sum().item()) / (n * (n ** 2 - 1))
                     
                     if verbose:
                         print(f"  [CSAQ] Sample {i+1}/{n_samples} - Spearman rho: {rho:.4f}")
@@ -119,9 +123,29 @@ class CausalProfiler:
     
     def _build_cliques(self):
         cliques_per_layer = {}
-        for name in self.modules.keys():
-            intersect = self.intersection[name].float()
-            f = self.freqs[name].float()
+        
+        try:
+            from tqdm import tqdm
+            modules_iter = tqdm(list(self.modules.keys()), desc="[CSAQ] Constructing Graphs")
+        except ImportError:
+            modules_iter = self.modules.keys()
+            
+        for name in modules_iter:
+            if not self.history[name]:
+                cliques_per_layer[name] = [[i] for i in range(self.modules[name].weight.shape[0])]
+                continue
+                
+            # Concatenate mask history (Total_N, n_out)
+            mask = torch.cat(self.history[name], dim=0).to(torch.float16)  
+            
+            # Compute intersection efficiently for just this layer
+            intersect = torch.matmul(mask.t(), mask).float()
+            f = mask.sum(dim=0).float()
+            
+            # Free up the history to keep RAM clean
+            del mask
+            self.history[name] = []
+            
             union = f.unsqueeze(1) + f.unsqueeze(0) - intersect
             union = union.clamp(min=1.0)
             jaccard = intersect / union
@@ -149,7 +173,12 @@ class CausalProfiler:
                     visited[i] = True
                     
                 layer_cliques.append(clique)
+                
             cliques_per_layer[name] = layer_cliques
+            
+            # Clean up the large NxN objects locally before moving to next layer
+            del intersect, union, jaccard
+            
         return cliques_per_layer
 
 # --- PHASE 3: Solver ---
