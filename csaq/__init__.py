@@ -9,7 +9,10 @@ Usage:
     config = CSAQConfig(target_bits=4.0)
     model, info = quantize(model, calib_data, config=config)
 
-Paper: "CSAQ: Causal Salience-Aware Quantization"
+    # Self-Speculative Decoding
+    from csaq import CSAQInferenceEngine
+    engine = CSAQInferenceEngine(model, info["causal_map"], tokenizer)
+    output, report = engine.generate_speculative(input_ids, lookahead=4)
 """
 
 from .config import CSAQConfig
@@ -20,13 +23,18 @@ from .core import (
     apply_csaq,
 )
 
+from .inference import (
+    CSAQInferenceEngine,
+    SpeculativeReport,
+)
+
 from .utils import (
     build_calibration_data,
     compute_perplexity,
-    generate_csaq_report
+    generate_csaq_report,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.3"
 __author__  = "Omdeep Borkar"
 __all__     = [
     "quantize",
@@ -34,7 +42,10 @@ __all__     = [
     "CausalProfiler",
     "solve_clique_budget",
     "apply_csaq",
+    "CSAQInferenceEngine",
+    "SpeculativeReport",
     "build_calibration_data",
     "compute_perplexity",
-    "generate_csaq_report"
+    "generate_csaq_report",
 ]
+

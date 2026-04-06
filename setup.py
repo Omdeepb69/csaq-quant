@@ -5,12 +5,12 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="csaq-quant",
-    version="0.1.4",
+    version="0.2.3",
     author="Omdeep Borkar",
     author_email="omdeepborkar@gmail.com",
     description=(
         "Causal Salience-Aware Quantization — gradient×activation-informed "
-        "interaction-graph LLM weight quantization targeting exact bit budgets"
+        "interaction-graph LLM weight quantization with self-speculative decoding"
     ),
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -41,6 +41,7 @@ setup(
     },
     keywords=[
         "quantization", "llm", "compression", "inference",
-        "causal salience", "mixed precision", "pytorch"
+        "causal salience", "mixed precision", "pytorch",
+        "speculative decoding",
     ],
 )
