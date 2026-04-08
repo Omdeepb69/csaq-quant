@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="csaq-quant",
-    version="0.2.3",
+    version="0.2.6",
     author="Omdeep Borkar",
     author_email="omdeepborkar@gmail.com",
     description=(

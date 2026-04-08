@@ -34,7 +34,7 @@ from .utils import (
     generate_csaq_report,
 )
 
-__version__ = "0.2.3"
+__version__ = "0.2.6"
 __author__  = "Omdeep Borkar"
 __all__     = [
     "quantize",
