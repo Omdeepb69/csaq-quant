@@ -34,6 +34,7 @@ setup(
         "datasets>=2.14.0",
         "tqdm>=4.66.0",
         "psutil>=5.9.0",
+        "safetensors",
     ],
     extras_require={
         "dev": ["pytest", "black", "isort"],

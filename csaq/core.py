@@ -100,6 +100,7 @@ class CausalProfiler:
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "weight", None) is not None and module.weight.requires_grad:
+                    # Exclude lm_head and embedding layers to prevent catastrophic generation failure
                     if "lm_head" in name or "embed" in name:
                         continue
                     self.modules[name] = module
@@ -230,6 +231,11 @@ class CausalProfiler:
         self.hooks.clear()
         self.model.eval()
 
+        # Track actual samples processed
+        actual_samples = i + 1
+        for name in self.salience:
+            self.salience[name] /= actual_samples
+
         cliques = self._build_cliques()
         return self.salience, cliques
 
@@ -248,7 +254,7 @@ class CausalProfiler:
                 ]
                 continue
 
-            mask = torch.cat(self.history[name], dim=0).to(torch.float16)
+            mask = torch.cat(self.history[name], dim=0).float()
             intersect = torch.matmul(mask.t(), mask).float()
             f = mask.sum(dim=0).float()
 
@@ -273,8 +279,8 @@ class CausalProfiler:
                         clique.append(n_idx.item())
                         visited[n_idx] = True
                 if not clique:
-                    clique = [i]
-                    visited[i] = True
+                    clique.append(i)
+                visited[i] = True
                 layer_cliques.append(clique)
 
             cliques_per_layer[name] = layer_cliques
@@ -522,9 +528,15 @@ def quantize(
     if verbose:
         print(f"[CSAQ] Starting Quantization Pipeline. Target: {config.target_bits} bits")
 
-    # Hard-coded Silence tied-weights
+    # Tie weights config update to prevent huggingface warnings.
+    # Mutating config limits its use in save_pretrained, so we warn the user.
     if hasattr(model, "config") and hasattr(model.config, "tie_word_embeddings"):
-        model.config.tie_word_embeddings = False
+        if model.config.tie_word_embeddings:
+            warnings.warn(
+                "[CSAQ] tie_word_embeddings=True is detected. Mutating to False to prevent HuggingFace warnings. "
+                "Ensure you save your config correctly if re-exporting."
+            )
+            model.config.tie_word_embeddings = False
     
     # v0.2.6 Hardening: Physically untie embeddings with .detach().clone()
     # to prevent cross-reference VRAM corruption during quantization.

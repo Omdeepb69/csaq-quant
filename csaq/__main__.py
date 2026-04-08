@@ -1,5 +1,6 @@
 import argparse
 import sys
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from .config import CSAQConfig
 from .core import quantize
@@ -19,7 +20,7 @@ def main():
     
     # Normally we load the model here
     try:
-        model = AutoModelForCausalLM.from_pretrained(args.model_path, device_map="cpu", torch_dtype="auto")
+        model = AutoModelForCausalLM.from_pretrained(args.model_path, device_map="cpu", torch_dtype=torch.float32)
         tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     except Exception as e:
         print(f"Failed to load model from {args.model_path}: {e}")

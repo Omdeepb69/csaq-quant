@@ -16,4 +16,8 @@ def quantize_shared_scale(W: torch.Tensor, leader_row: torch.Tensor, bits: int) 
     max_val = 2 ** (bits - 1) - 1
     # Leader's scale
     scale = leader_row.abs().max().clamp(min=1e-8) / max_val
-    return (W / scale).round().clamp(-max_val - 1, max_val) * scale
+    scaled_W = W / scale
+    if (scaled_W.abs().max() > max_val * 2.0):
+        import warnings
+        warnings.warn("[CSAQ] Follower row values significantly exceed leader's range; severe mis-quantization may occur.")
+    return scaled_W.round().clamp(-max_val - 1, max_val) * scale

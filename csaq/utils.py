@@ -79,15 +79,15 @@ def generate_csaq_report(info: Dict, save_path: str = "./CSAQ_Report.json"):
     tier_stats = info.get("tier_stats", {})
     total_elems = sum(tier_stats.values()) if tier_stats else 1
     
-    # Calculate overlap using dummy heuristic if not fully available
-    overlap = 0.85 # Placeholder for overlap between Causal and Magnitude importance
+    # Calculate overlap using actual dataset or placeholder fallback
+    overlap = info.get("overlap_pct", "Not Computed")
     
     report = {
         "Salience_Magnitude_Overlap_Pct": overlap,
         "Bit_Distribution_Histogram": {
             t: count for t, count in tier_stats.items()
         },
-        "Pareto_Efficiency_Score": 0.92, # Placeholder value for report schema
+        "Pareto_Efficiency_Score": info.get("pareto_score", "Not Computed"),
         "Total_Cliques": info.get("cliques_count", 0),
         "Quantized_Params": total_elems
     }
@@ -105,7 +105,6 @@ def export_csaq_model(model, config, budget, save_path: str):
     
     # 1. Save config with architecture updates
     config_dict = config.to_dict()
-    config_dict["architectures"] = ["CSAQForCausalLM"]
     # Save the budget details inside the config file or logic mappings
     with open(os.path.join(save_path, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=4)

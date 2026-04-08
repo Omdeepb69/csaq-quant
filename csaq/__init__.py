@@ -32,6 +32,7 @@ from .utils import (
     build_calibration_data,
     compute_perplexity,
     generate_csaq_report,
+    export_csaq_model,
 )
 
 __version__ = "0.2.6"
@@ -47,5 +48,6 @@ __all__     = [
     "build_calibration_data",
     "compute_perplexity",
     "generate_csaq_report",
+    "export_csaq_model",
 ]
 

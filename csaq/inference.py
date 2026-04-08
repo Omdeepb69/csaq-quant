@@ -428,7 +428,7 @@ class CSAQInferenceEngine:
 
             mask = sorted_indices_to_remove
             sorted_logits[mask] = -1e10
-            scaled = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+            scaled = torch.empty_like(scaled).scatter_(1, sorted_indices, sorted_logits)
 
         probs = F.softmax(scaled, dim=-1)
 
@@ -597,6 +597,7 @@ class CSAQInferenceEngine:
                             "action": "break_draft",
                         })
                         if self.device.type == "cuda":
+                            torch.cuda.synchronize(self.device)
                             torch.cuda.empty_cache()
                         draft_failed = True
                         break
@@ -656,6 +657,8 @@ class CSAQInferenceEngine:
                         else:
                             draft_token_ids[:, k] = verify_token
                             n_accepted += 1
+                            report.tokens_rejected += 1
+                            report.tokens_accepted -= 1
                             break
                     else:
                         p_draft = F.softmax(
@@ -699,6 +702,8 @@ class CSAQInferenceEngine:
                                 corrected = verify_logit_k.argmax(dim=-1, keepdim=True)
                             draft_token_ids[:, k] = corrected.squeeze(-1)
                             n_accepted += 1
+                            report.tokens_rejected += 1
+                            report.tokens_accepted -= 1
                             break
 
                 # ── STEP 4: COMMIT ────────────────────────────────────────────
@@ -721,6 +726,7 @@ class CSAQInferenceEngine:
 
         except Exception as e:
             if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
                 torch.cuda.empty_cache()
             warnings.warn(f"[CSAQ] Speculative Engine Exception: {str(e)}")
             self._ensure_draft_state()
