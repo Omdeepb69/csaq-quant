@@ -5,16 +5,13 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="csaq-quant",
-    version="0.2.6",
+    version="0.3.4",
     author="Omdeep Borkar",
     author_email="omdeepborkar@gmail.com",
-    description=(
-        "Causal Salience-Aware Quantization — gradient×activation-informed "
-        "interaction-graph LLM weight quantization with self-speculative decoding"
-    ),
+    description="Causal Salience-Aware Quantization - Mixed precision LLM weights with self-speculative decoding",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/omdeepb69/csaq-quant",
+    url="https://github.com/Omdeepb69/csaq-quant",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",

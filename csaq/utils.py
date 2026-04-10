@@ -20,7 +20,8 @@ def build_calibration_data(
     texts = []
     if hard:
         try:
-            ds = load_dataset("hendrycks/competition_math", split="test", trust_remote_code=True)
+            # Fixed: 'main' configuration and removed deprecated trust_remote_code
+            ds = load_dataset("hendrycks/competition_math", "main", split="test")
             texts += [f"Problem: {x['problem']}\nSolution: {x['solution']}" for x in list(ds)[:n//3]]
         except Exception:
             pass

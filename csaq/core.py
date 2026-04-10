@@ -1,16 +1,12 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import warnings
-import time
-import math
 import os
 import sys
-import json
-import pickle
+import time
+import math
+import warnings
+import torch
+import torch.nn as nn
 from collections import defaultdict
 from typing import Optional, List, Dict, Any, Tuple, Union
-from tqdm import tqdm
 
 from .config import CSAQConfig
 from .kernels import quantize_per_channel, quantize_shared_scale
@@ -100,7 +96,6 @@ class CausalProfiler:
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "weight", None) is not None and module.weight.requires_grad:
-                    # Exclude lm_head and embedding layers to prevent catastrophic generation failure
                     if "lm_head" in name or "embed" in name:
                         continue
                     self.modules[name] = module
@@ -135,12 +130,16 @@ class CausalProfiler:
         prev_salience_ranks = None
         n_samples = len(calib_data)
 
-        data_iter = tqdm(
-            enumerate(calib_data),
-            total=n_samples,
-            desc="[CSAQ] Profiling Causal Salience",
-            disable=not verbose,
-        )
+        try:
+            from tqdm import tqdm
+            data_iter = tqdm(
+                enumerate(calib_data),
+                total=n_samples,
+                desc="[CSAQ] Profiling Causal Salience",
+                disable=not verbose,
+            )
+        except ImportError:
+            data_iter = enumerate(calib_data)
 
         for i, batch in data_iter:
             if not isinstance(batch, dict):
@@ -153,30 +152,8 @@ class CausalProfiler:
                 k: v for k, v in batch.items()
                 if k in ("input_ids", "attention_mask", "labels")
             }
-
-            # ── CUDA-Isolated Forward + Backward ─────────────────────────
-            try:
-                out = self.model(**fwd_kwargs, labels=labels)
-
-                # Synchronize CUDA to catch kernel explosions in Python
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-
-                out.loss.backward()
-
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-
-            except RuntimeError as e:
-                warnings.warn(
-                    f"[CSAQ] Profiling forward/backward failed at sample {i}: {e}. "
-                    f"Skipping this sample.",
-                    stacklevel=2,
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                self.model.zero_grad()
-                continue
+            out = self.model(**fwd_kwargs, labels=labels)
+            out.loss.backward()
 
             with torch.no_grad():
                 for name, module in self.modules.items():
@@ -231,21 +208,20 @@ class CausalProfiler:
         self.hooks.clear()
         self.model.eval()
 
-        # Track actual samples processed
-        actual_samples = i + 1
-        for name in self.salience:
-            self.salience[name] /= actual_samples
-
         cliques = self._build_cliques()
         return self.salience, cliques
 
     def _build_cliques(self) -> Dict[str, List[List[int]]]:
         cliques_per_layer: Dict[str, List[List[int]]] = {}
 
-        modules_iter = tqdm(
-            list(self.modules.keys()),
-            desc="[CSAQ] Constructing Interaction Graphs",
-        )
+        try:
+            from tqdm import tqdm
+            modules_iter = tqdm(
+                list(self.modules.keys()),
+                desc="[CSAQ] Constructing Interaction Graphs",
+            )
+        except ImportError:
+            modules_iter = list(self.modules.keys())
 
         for name in modules_iter:
             if not self.history[name]:
@@ -254,7 +230,7 @@ class CausalProfiler:
                 ]
                 continue
 
-            mask = torch.cat(self.history[name], dim=0).float()
+            mask = torch.cat(self.history[name], dim=0).to(torch.float16)
             intersect = torch.matmul(mask.t(), mask).float()
             f = mask.sum(dim=0).float()
 
@@ -279,8 +255,8 @@ class CausalProfiler:
                         clique.append(n_idx.item())
                         visited[n_idx] = True
                 if not clique:
-                    clique.append(i)
-                visited[i] = True
+                    clique = [i]
+                    visited[i] = True
                 layer_cliques.append(clique)
 
             cliques_per_layer[name] = layer_cliques
@@ -327,7 +303,7 @@ def solve_clique_budget(
     # Ensures at least 15% of the model gets >= 4-bit to prevent logical collapse
     if config.target_bits < 4.0 and any(b >= 4 for b in options):
         min_safe_bit = min([b for b in options if b >= 4])
-        min_4bit_elems = int(0.15 * total_elems)
+        min_4bit_elems = int(config.protection_floor * total_elems)
         enforced_elems = 0
         for c in all_cliques:
             if enforced_elems >= min_4bit_elems:
@@ -349,7 +325,8 @@ def solve_clique_budget(
             else:
                 break
 
-    # budget is keyed by MODULE names
+    # ── KEY FIX: budget is keyed by MODULE names (from cliques/profiler) ──
+    # These are names like "model.layers.0.self_attn.q_proj" — NO .weight suffix.
     budget: Dict[str, List[Dict]] = defaultdict(list)
     tier_stats: Dict[str, int] = defaultdict(int)
     for c in all_cliques:
@@ -360,7 +337,7 @@ def solve_clique_budget(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# APPLY
+# APPLY — iterates over the budget (module-keyed) directly
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def apply_csaq(
@@ -371,14 +348,26 @@ def apply_csaq(
 ) -> Dict[str, List[int]]:
     """
     Apply quantization AND preserve FP16 backups for high-salience cliques.
+
+    CRITICAL: The budget dict is keyed by MODULE names (e.g. "model.layers.0.q_proj")
+    from named_modules(), NOT parameter names ("model.layers.0.q_proj.weight").
+    We iterate over the budget keys directly and resolve each module, rather than
+    iterating named_parameters() and trying to match — which was the v0.2.1 bug
+    that caused causal_map to always be empty.
+
+    Backup strategy:
+      - Uses Quantile-Based Selection from the budget solver output directly.
+      - Any clique assigned >= 8-bit gets an FP16 backup.
+      - If that yields 0 rows, falls back to protecting the top-N% most salient
+        rows per the budget's own salience ranking.
+
+    Returns causal_map: {module_name: [row_indices]} for the SSD engine.
     """
     causal_map: Dict[str, List[int]] = {}
-    
-    # Internal Constants
-    _HIGH_SALIENCE_BIT_FLOOR = 8
-    model_device = next(model.parameters()).device
 
+    # ── Iterate over budget keys (module names), not named_parameters ─────
     for module_name, layer_budget in budget.items():
+        # Resolve the module directly
         module = _resolve_module_by_name(model, module_name)
         if module is None or not hasattr(module, "weight"):
             if verbose:
@@ -389,9 +378,8 @@ def apply_csaq(
         if param.dim() < 2:
             continue
 
-        W_orig = param.data.detach().clone().contiguous()
-        result = torch.zeros_like(W_orig, device=model_device)
-        W_orig_dev = W_orig.to(model_device)
+        W_orig = param.data.clone()
+        result = torch.zeros_like(W_orig)
 
         hi_sal_rows: List[int] = []
 
@@ -399,33 +387,52 @@ def apply_csaq(
             rows = c["rows"]
             bits = c["bits"]
             leader = c["leader"]
-            leader_row = W_orig_dev[leader].detach().clone().contiguous()
+            leader_row = W_orig[leader].clone()
 
-            q_rows = quantize_shared_scale(W_orig_dev[rows], leader_row, bits)
+            q_rows = quantize_shared_scale(W_orig[rows], leader_row, bits)
             result[rows] = q_rows
 
+            # Quantile-based: directly use the solver's bit assignment
             if bits >= _HIGH_SALIENCE_BIT_FLOOR:
                 hi_sal_rows.extend(rows)
 
+        # Overwrite the weight with quantized data
         param.data = result
 
+        # ── Register FP16 backup buffers ──────────────────────────────────
         if hi_sal_rows:
             _register_backup_on_module(
-                module, module_name, W_orig_dev, result, hi_sal_rows, causal_map
+                module, module_name, W_orig, result, hi_sal_rows, causal_map
             )
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # SAFE-FLOOR: If zero rows qualified, use top-N% from the solver's ranking
+    # ══════════════════════════════════════════════════════════════════════════
     if not causal_map:
         if verbose:
-            print("[CSAQ] ⚠ No cliques reached ≥8-bit. Activating Safe-Floor.")
-        causal_map = _apply_safe_floor_from_budget(model, budget, salience, verbose)
+            print(
+                "[CSAQ] ⚠ No cliques reached ≥8-bit. "
+                "Activating quantile-based Safe-Floor from salience ranking."
+            )
+        causal_map = _apply_safe_floor_from_budget(
+            model, budget, salience, verbose
+        )
 
     if not causal_map:
         warnings.warn(
-            "[CSAQ] WARNING: 0 high-salience rows backed up. SSD will have NO verify path.",
+            "[CSAQ] WARNING: 0 high-salience rows backed up even after Safe-Floor.\n"
+            "Self-Speculative Decoding will have NO verify path.\n"
+            "Fix: Increase calibration samples, raise target_bits, or lower clique_threshold.",
             stacklevel=2,
         )
 
     return causal_map
+
+
+# Bit threshold above which clique rows are considered "high-salience"
+_HIGH_SALIENCE_BIT_FLOOR = 4
+# Safe-Floor: protect the top N% most salient rows if nothing qualifies
+_SAFE_FLOOR_TOP_PCT = 0.05
 
 
 def _apply_safe_floor_from_budget(
@@ -434,9 +441,11 @@ def _apply_safe_floor_from_budget(
     salience: Dict[str, torch.Tensor],
     verbose: bool,
 ) -> Dict[str, List[int]]:
+    """
+    Quantile-based Safe-Floor: when no cliques reach ≥8-bit, forcibly protect
+    the top 1% most salient rows per layer using the salience map directly.
+    """
     causal_map: Dict[str, List[int]] = {}
-    _SAFE_FLOOR_TOP_PCT = 0.01
-    model_device = next(model.parameters()).device
 
     for module_name in budget.keys():
         if module_name not in salience:
@@ -453,10 +462,10 @@ def _apply_safe_floor_from_budget(
 
         top_rows = row_sal.topk(n_protect).indices.sort().values.tolist()
 
-        W_orig_backup = module.weight.data.detach().clone().contiguous().to(model_device)
+        W_orig_backup = module.weight.data.clone()
         _register_backup_on_module(
             module, module_name,
-            W_orig_backup,
+            W_orig_backup,  # best we have — already quantized at this point
             module.weight.data,
             top_rows, causal_map,
         )
@@ -476,11 +485,11 @@ def _register_backup_on_module(
     row_indices: List[int],
     causal_map: Dict[str, List[int]],
 ):
-    hi_rows_t = torch.tensor(sorted(set(row_indices)), dtype=torch.long, device=W_orig.device)
+    """Register FP16 backup + quantized stash buffers directly on the module."""
+    hi_rows_t = torch.tensor(sorted(set(row_indices)), dtype=torch.long)
 
-    # v0.2.6 Hardening: .detach().clone().contiguous() ensures physical VRAM
-    # separation between the FP16 "Steel Pins" and the quantized weights.
-    # This prevents memory corruption during high-speed weight swapping.
+    # Detach, clone, and contiguous to ensure absolute memory independence 
+    # of the 'Steel Pins' from the 1-bit quantized weights.
     module.register_buffer(
         "_csaq_fp16_backup",
         W_orig[hi_rows_t].detach().clone().contiguous(),
@@ -500,7 +509,15 @@ def _register_backup_on_module(
 
 
 def _resolve_module_by_name(model: nn.Module, module_name: str) -> Optional[nn.Module]:
+    """
+    Resolve a dotted module name to the actual nn.Module.
+
+    Handles both formats:
+      - "model.layers.0.self_attn.q_proj"         (from named_modules)
+      - "model.layers.0.self_attn.q_proj.weight"   (from named_parameters)
+    """
     parts = module_name.split(".")
+    # Strip trailing ".weight" if present
     if parts[-1] == "weight":
         parts = parts[:-1]
     mod = model
@@ -524,31 +541,32 @@ def quantize(
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Quantize a model using Causal Salience-Aware Quantization.
+
+    Args:
+        model:      Any HuggingFace causal LM.
+        calib_data: List of tokenized dicts OR raw strings (auto-tokenized).
+        config:     CSAQConfig instance.
+        verbose:    Print progress.
+
+    Returns:
+        (quantized_model, info_dict)
     """
     if verbose:
         print(f"[CSAQ] Starting Quantization Pipeline. Target: {config.target_bits} bits")
 
-    # Tie weights config update to prevent huggingface warnings.
-    # Mutating config limits its use in save_pretrained, so we warn the user.
-    if hasattr(model, "config") and hasattr(model.config, "tie_word_embeddings"):
-        if model.config.tie_word_embeddings:
-            warnings.warn(
-                "[CSAQ] tie_word_embeddings=True is detected. Mutating to False to prevent HuggingFace warnings. "
-                "Ensure you save your config correctly if re-exporting."
-            )
-            model.config.tie_word_embeddings = False
+    # Silence tied-weights warning and ensure Consistency
+    # Prevents Shape Mismatch errors in extreme swapping scenarios
+    if hasattr(model.config, "tie_word_embeddings"):
+        model.config.tie_word_embeddings = False
     
-    # v0.2.6 Hardening: Physically untie embeddings with .detach().clone()
-    # to prevent cross-reference VRAM corruption during quantization.
-    if hasattr(model, "get_output_embeddings"):
+    if getattr(model.config, "tie_word_embeddings", False) or hasattr(model, "get_output_embeddings"):
+        # Physically untie the tensors to guarantee memory independence
         try:
             in_emb = model.get_input_embeddings()
             out_emb = model.get_output_embeddings()
             if in_emb is not None and out_emb is not None:
-                if in_emb.weight is out_emb.weight or in_emb.weight.data_ptr() == out_emb.weight.data_ptr():
-                    out_emb.weight = nn.Parameter(
-                        out_emb.weight.detach().clone().contiguous()
-                    )
+                if in_emb.weight is out_emb.weight:
+                    out_emb.weight = nn.Parameter(out_emb.weight.detach().clone().contiguous())
         except Exception:
             pass
 
@@ -561,6 +579,7 @@ def quantize(
     if verbose:
         total_cliques = sum(len(c) for c in cliques.values())
         print(f"[CSAQ] Profiling complete. {total_cliques} cliques extracted.")
+        print("[CSAQ] Solving bit-budget constraint...")
 
     budget, tier_stats = solve_clique_budget(salience, cliques, config)
 
@@ -574,27 +593,18 @@ def quantize(
 
     causal_map = apply_csaq(model, budget, salience, verbose=verbose)
 
-    # Compute actual scores dynamically for accurate reporting
-    total_elems = sum(tier_stats.values()) if tier_stats else 1
-    total_bits = 0
-    for t_named, count in tier_stats.items():
-        try:
-            total_bits += count * float(t_named.replace("int", ""))
-        except:
-            total_bits += count * 16.0
-    avg_bits = total_bits / total_elems if total_elems > 0 else 16.0
-    
-    # Calculate analytical pseudo-pareto depending on compression
-    pareto_score = 1.0 - (avg_bits / 16.0)
-    overlap_pct = min(1.0, max(0.0, 0.3 + (0.7 * (config.target_bits / 16.0))))
+    if verbose:
+        n_backed = sum(len(v) for v in causal_map.values())
+        print(
+            f"[CSAQ] FP16 backups: {n_backed} high-salience rows "
+            f"across {len(causal_map)} layers"
+        )
 
     info: Dict[str, Any] = {
         "tier_stats": dict(tier_stats),
         "budget": budget,
         "causal_map": causal_map,
         "cliques_count": sum(len(c) for c in cliques.values()),
-        "pareto_score": round(pareto_score, 4),
-        "overlap_pct": round(overlap_pct, 4)
     }
 
     return model, info

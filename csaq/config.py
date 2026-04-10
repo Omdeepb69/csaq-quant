@@ -14,6 +14,7 @@ class CSAQConfig(PretrainedConfig):
         speculative_lookahead: int = 4,
         speculative_temperature: float = 1.0,
         salience_alpha: float = 1.0,
+        protection_floor: float = 0.20,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -24,3 +25,4 @@ class CSAQConfig(PretrainedConfig):
         self.speculative_lookahead = speculative_lookahead
         self.speculative_temperature = speculative_temperature
         self.salience_alpha = salience_alpha
+        self.protection_floor = protection_floor
