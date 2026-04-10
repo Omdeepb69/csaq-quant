@@ -314,16 +314,34 @@ def solve_clique_budget(
                 c["bits"] = min_safe_bit
                 enforced_elems += c["elems"]
 
-    for c in all_cliques:
-        for b in options:
+    # Pass 1: Structural Skeleton - ensure everything gets at least a safe floor
+    min_ops = [b for b in options if b >= 2]
+    if min_ops:
+        safe_floor = min_ops[0]
+        # Only apply hard floor if budget allows
+        if target_total_bits >= safe_floor * total_elems:
+            for c in all_cliques:
+                if c["bits"] < safe_floor:
+                    cost = (safe_floor - c["bits"]) * c["elems"]
+                    current_bits += cost
+                    c["bits"] = safe_floor
+
+    # Pass 2: Smooth Scaling - upgrade in steps (2 -> 4 -> 8 -> 16)
+    # This prevents the solver from using all the budget on 16-bit 'spikes'
+    for b in options:
+        for c in all_cliques:
             if b <= c["bits"]:
                 continue
             cost = (b - c["bits"]) * c["elems"]
+            
+            # Weighted salience check to prioritize bang-for-buck
             if current_bits + cost <= target_total_bits:
                 current_bits += cost
                 c["bits"] = b
             else:
-                break
+                # If we can't afford this bit-level, we might still afford others for this clique later
+                continue 
+
 
     # ── KEY FIX: budget is keyed by MODULE names (from cliques/profiler) ──
     # These are names like "model.layers.0.self_attn.q_proj" — NO .weight suffix.
@@ -356,10 +374,9 @@ def apply_csaq(
     that caused causal_map to always be empty.
 
     Backup strategy:
-      - Uses Quantile-Based Selection from the budget solver output directly.
-      - Any clique assigned >= 8-bit gets an FP16 backup.
-      - If that yields 0 rows, falls back to protecting the top-N% most salient
-        rows per the budget's own salience ranking.
+      - Deterministic Protection: Protects the top N% of the most salient rows 
+        globally across all layers to ensure a structural FP16 backbone.
+      - Any clique assigned 16-bit also gets an FP16 backup.
 
     Returns causal_map: {module_name: [row_indices]} for the SSD engine.
     """
@@ -383,6 +400,8 @@ def apply_csaq(
 
         hi_sal_rows: List[int] = []
 
+        # Deterministic: If bits=16, always backup. 
+        # Otherwise, the Safe-Floor below handles the top 10% across the model.
         for c in layer_budget:
             rows = c["rows"]
             bits = c["bits"]
@@ -392,8 +411,7 @@ def apply_csaq(
             q_rows = quantize_shared_scale(W_orig[rows], leader_row, bits)
             result[rows] = q_rows
 
-            # Quantile-based: directly use the solver's bit assignment
-            if bits >= _HIGH_SALIENCE_BIT_FLOOR:
+            if bits >= 16:
                 hi_sal_rows.extend(rows)
 
         # Overwrite the weight with quantized data
@@ -430,9 +448,9 @@ def apply_csaq(
 
 
 # Bit threshold above which clique rows are considered "high-salience"
-_HIGH_SALIENCE_BIT_FLOOR = 4
-# Safe-Floor: protect the top N% most salient rows if nothing qualifies
-_SAFE_FLOOR_TOP_PCT = 0.05
+_HIGH_SALIENCE_BIT_FLOOR = 16
+# Safe-Floor: protect the top N% most salient rows (Deterministic Accuracy Backbone)
+_SAFE_FLOOR_TOP_PCT = 0.10
 
 
 def _apply_safe_floor_from_budget(
