@@ -110,7 +110,18 @@ def export_csaq_model(model, config, budget, save_path: str):
     with open(os.path.join(save_path, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=4)
         
-    # 2. Serialize weights
+    # 3. Create 'Instant-Wake' manifest
+    manifest = {
+        "causal_map": info.get("causal_map", {}),
+        "clique_budget": info.get("tier_stats", {}),
+        "version": "0.3.8",
+        "salience_overlap": info.get("overlap_pct", 0.0)
+    }
+    
+    with open(os.path.join(save_path, "csaq_manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=4)
+        
+    # Serialize weights
     state_dict = model.state_dict()
     
     # 3. Add explicit buffer for the leader logic if necessary (simplified)

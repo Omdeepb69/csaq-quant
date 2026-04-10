@@ -94,8 +94,24 @@ class CSAQInferenceEngine:
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.device = next(model.parameters()).device
         self._in_verify = False
+        self.telemetry = {
+            "total_tokens": 0,
+            "accepted_tokens": 0,
+            "backpressure_events": 0, 
+        }
+        self._warmup_complete = False
+
+    def warmup(self, n: int = 5):
+        """Warmup the CUDA kernels and Python loops to stabilize metrics."""
+        if self._warmup_complete:
+            return
+        dummy_in = torch.tensor([[111]], device=self.device)
+        with torch.no_grad():
+            for _ in range(n):
+                self.generate(dummy_in, max_new_tokens=4, speculative=True)
+        self._warmup_complete = True
+        print("[CSAQ] Inference Engine Warmup Complete.")
 
         # ── Pre-calculate hooked layers ───────────────────────────────────
         self._hooks: List[_HookEntry] = []
@@ -400,6 +416,16 @@ class CSAQInferenceEngine:
                 accepted_tokens = draft_token_ids[:, :n_accepted]
                 generated = torch.cat([generated, accepted_tokens], dim=-1)
                 tokens_produced += n_accepted
+
+                # ── TELEMETRY ──
+                self.telemetry["total_tokens"] += K
+                self.telemetry["accepted_tokens"] += n_accepted
+                rate = n_accepted / max(K, 1)
+                if rate < 0.20: # If less than 20% accepted, the 4-bit 'Draft' is struggling
+                    self.telemetry["backpressure_events"] += 1
+                    # Minimal logging to prevent I/O slowdown
+                    if tokens_produced % 50 == 0:
+                        print(f"  [CSAQ Telemetry] ⚠ Backpressure on Safe-Floor (Acceptance: {rate*100:.1f}%)")
 
                 report.tokens_accepted += n_accepted
                 report.tokens_rejected += (K - n_accepted)

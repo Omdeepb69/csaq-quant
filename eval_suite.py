@@ -1,5 +1,5 @@
 """
-eval_suite.py — Production-Grade Validation Suite for CSAQ v0.3.7
+eval_suite.py — Production-Grade Validation Suite for CSAQ v0.3.8
 Optimized for Google Colab and high-stability research deployments.
 """
 
@@ -58,9 +58,9 @@ def run_evaluation():
     if os.path.exists(REPORT_FILE):
         os.remove(REPORT_FILE)
     
-    log_to_report("# CSAQ Architectural Hardening Report (v0.3.7)")
+    log_to_report("# CSAQ Architectural Hardening Report (v0.3.8)")
     log_to_report(f"**Date:** {time.ctime()} ({'Google Colab' if IS_COLAB else 'Local'})")
-    log_to_report("**Mode:** Industrial Core (10% Deterministic Floor)")
+    log_to_report("**Mode:** Enterprise Ready (Warmup + Manifest Support)")
     log_to_report("\n" + "="*80 + "\n")
 
     for model_id in MODELS_TO_TEST:
@@ -122,6 +122,8 @@ def run_evaluation():
                 
                 # SSD Benchmark
                 engine = CSAQInferenceEngine(q_model, info["causal_map"], tokenizer)
+                print("[SUITE] Performing Inference Warmup...")
+                engine.warmup(n=5) # Stabilize kernels before measuring
                 
                 # Run Multi-Scenario Comparison
                 log_to_report("\n#### 📝 Generation Comparison")

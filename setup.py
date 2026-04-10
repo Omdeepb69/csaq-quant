@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="csaq-quant",
-    version="0.3.7",
+    version="0.3.8",
     author="Omdeep Borkar",
     author_email="omdeepborkar@gmail.com",
     description="Causal Salience-Aware Quantization - Mixed precision LLM weights with self-speculative decoding",
