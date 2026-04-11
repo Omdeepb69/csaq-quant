@@ -1,12 +1,13 @@
 """
-csaq/utils.py — calibration data builders, evaluation helpers, and reporting
+csaq/utils.py — calibration data builders, evaluation helpers, and reporting (v0.3.9)
 """
 
 import torch
 import numpy as np
 import json
 import os
-from typing import Optional, List, Dict
+import warnings
+from typing import Optional, List, Dict, Any
 
 def build_calibration_data(
     tokenizer,
@@ -31,9 +32,13 @@ def build_calibration_data(
         except Exception:
             pass
         if len(texts) < n:
-            ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
-            texts += [t for t in ds["text"][5000:] if len(t.strip()) > 80][:n-len(texts)]
-    else:
+            try:
+                ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
+                texts += [t for t in ds["text"][5000:] if len(t.strip()) > 80][:n-len(texts)]
+            except:
+                pass
+    
+    if not texts:
         ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
         texts = [t for t in ds["text"] if len(t.strip()) > 80]
 
@@ -80,7 +85,7 @@ def generate_csaq_report(info: Dict, save_path: str = "./CSAQ_Report.json"):
     tier_stats = info.get("tier_stats", {})
     total_elems = sum(tier_stats.values()) if tier_stats else 1
     
-    # Calculate overlap using actual dataset or placeholder fallback
+    # Bug 0 Fix: Pull overlap_pct from info
     overlap = info.get("overlap_pct", "Not Computed")
     
     report = {
@@ -98,7 +103,7 @@ def generate_csaq_report(info: Dict, save_path: str = "./CSAQ_Report.json"):
         
     print(f"[CSAQ] Report saved to {save_path}")
 
-def export_csaq_model(model, config, budget, save_path: str):
+def export_csaq_model(model, config, budget, save_path: str, info: Dict = None):
     """Export model to safetensors keeping Hugging Face compatibility in mind."""
     import safetensors.torch
     
@@ -106,31 +111,22 @@ def export_csaq_model(model, config, budget, save_path: str):
     
     # 1. Save config with architecture updates
     config_dict = config.to_dict()
-    # Save the budget details inside the config file or logic mappings
     with open(os.path.join(save_path, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=4)
         
-    # 3. Create 'Instant-Wake' manifest
-    manifest = {
-        "causal_map": info.get("causal_map", {}),
-        "clique_budget": info.get("tier_stats", {}),
-        "version": "0.3.8",
-        "salience_overlap": info.get("overlap_pct", 0.0)
-    }
-    
-    with open(os.path.join(save_path, "csaq_manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=4)
+    # Bug 3 Fix: Handle 'info' for manifest serialization
+    if info:
+        manifest = {
+            "causal_map": info.get("causal_map", {}),
+            "clique_budget": info.get("tier_stats", {}),
+            "version": "0.3.9",
+            "salience_overlap": info.get("overlap_pct", 0.0)
+        }
+        with open(os.path.join(save_path, "csaq_manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=4)
         
-    # Serialize weights
+    # 2. Serialize weights
     state_dict = model.state_dict()
-    
-    # 3. Add explicit buffer for the leader logic if necessary (simplified)
-    # The actual implementation of Dequantization loads normal safetensors, 
-    # but the custom class CSAQForCausalLM would interpret it correctly.
     safetensors.torch.save_file(state_dict, os.path.join(save_path, "model.safetensors"))
-    
-    # Additionally save the constraint mappings side-by-side
-    with open(os.path.join(save_path, "csaq_clique_map.json"), "w") as f:
-        json.dump(budget, f, indent=4)
         
     print(f"[CSAQ] Model exported via safetensors to {save_path}")

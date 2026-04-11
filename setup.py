@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="csaq-quant",
-    version="0.3.8",
+    version="0.4.1",
     author="Omdeep Borkar",
     author_email="omdeepborkar@gmail.com",
     description="Causal Salience-Aware Quantization - Mixed precision LLM weights with self-speculative decoding",
@@ -32,6 +32,7 @@ setup(
         "tqdm>=4.66.0",
         "psutil>=5.9.0",
         "safetensors",
+        "matplotlib",
     ],
     extras_require={
         "dev": ["pytest", "black", "isort"],
