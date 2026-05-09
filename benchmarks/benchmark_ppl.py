@@ -132,6 +132,8 @@ def run_benchmark(
         rows.append({
             "label": label, "actual_bits": info["actual_bits"],
             "ppl": ppl, "elapsed_s": q_time,
+            "memory_saved_gb": info["memory_saved_gb"],
+            "memory_saved_pct": info["memory_saved_pct"]
         })
         print(f"  Actual bits: {info['actual_bits']:.3f}  |  PPL: {ppl:.3f}")
         del model
@@ -139,16 +141,17 @@ def run_benchmark(
 
     # Table
     baseline_ppl = rows[0]["ppl"]
-    print("\n" + "─" * 68)
-    print(f"{'Config':<30}  {'Bits':>6}  {'PPL':>8}  {'vs FP32':>9}  {'Time':>7}")
-    print("─" * 68)
+    print("\n" + "─" * 85)
+    print(f"{'Config':<30}  {'Bits':>6}  {'PPL':>8}  {'vs FP32':>9}  {'VRAM saved':>15}  {'Time':>7}")
+    print("─" * 85)
     for row in rows:
         vs = "—" if row["ppl"] == baseline_ppl else f"+{(row['ppl'] / baseline_ppl - 1) * 100:.1f}%"
+        mem = "—" if row.get("memory_saved_gb", 0.0) == 0.0 else f"{row['memory_saved_gb']:.2f}GB ({row['memory_saved_pct']:.0f}%)"
         print(
             f"{row['label']:<30}  {row['actual_bits']:>6.2f}  "
-            f"{row['ppl']:>8.3f}  {vs:>9}  {row['elapsed_s']:>6.1f}s"
+            f"{row['ppl']:>8.3f}  {vs:>9}  {mem:>15}  {row['elapsed_s']:>6.1f}s"
         )
-    print("─" * 68 + "\n")
+    print("─" * 85 + "\n")
 
 
 def main() -> None:

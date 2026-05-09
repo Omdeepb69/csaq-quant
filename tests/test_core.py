@@ -198,6 +198,15 @@ def test_quantize_returns_model_and_info(tiny_model, calib_data, config) -> None
     assert info["cliques_count"] > 0
 
 
+def test_quantize_reports_memory_keys(tiny_model, calib_data, config) -> None:
+    _, info = quantize(tiny_model, calib_data, config=config, verbose=False)
+    assert "memory_before_gb" in info
+    assert "memory_after_gb" in info
+    assert "memory_saved_gb" in info
+    assert "memory_saved_pct" in info
+    assert info["memory_saved_gb"] >= 0.0
+
+
 def test_quantize_replaces_linear_layers(tiny_model, calib_data, config) -> None:
     model, _ = quantize(tiny_model, calib_data, config=config, verbose=False)
     linear_count = sum(1 for _, m in model.named_modules() if isinstance(m, CSAQLinear))

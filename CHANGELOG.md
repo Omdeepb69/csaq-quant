@@ -7,7 +7,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [0.5.0] — 2024-01-XX  *(current)*
+## [0.5.1] — 2024-05-09 *(current)*
+
+### Changed
+- Bumped version to 0.5.1 for PyPI release.
+
+---
+
+## [0.5.0] — 2024-01-XX
 
 ### Breaking changes
 - `bit_options` default changed from `[1, 2, 4, 8, 16]` to `[4, 8, 16]`.
@@ -83,5 +90,6 @@ Initial internal revision.  Core algorithm sketch, no tests, no packing.
 
 ---
 
+[0.5.1]: https://github.com/omdeepb69/csaq-quant/releases/tag/v0.5.1
 [0.5.0]: https://github.com/omdeepb69/csaq-quant/releases/tag/v0.5.0
 [0.4.1]: https://github.com/omdeepb69/csaq-quant/releases/tag/v0.4.1

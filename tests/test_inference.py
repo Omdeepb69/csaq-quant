@@ -105,8 +105,14 @@ def test_speculative_report_summary_keys() -> None:
     r = SpeculativeReport(tokens_generated=10, tokens_accepted=8, verify_calls=3)
     s = r.summary()
     for key in ("mode", "tokens_generated", "acceptance_rate", "speedup_factor",
-                "inter_token_latency_ms", "block_efficiency"):
+                "inter_token_latency_ms", "block_efficiency", "p95_latency_ms", "tokens_per_second"):
         assert key in s, f"Missing key: {key}"
+
+def test_speculative_report_tps() -> None:
+    r = SpeculativeReport(tokens_generated=20, total_wallclock_s=2.0)
+    assert r.tokens_per_second == 10.0
+    r2 = SpeculativeReport(tokens_generated=20, total_wallclock_s=0.0)
+    assert r2.tokens_per_second == 0.0
 
 
 def test_block_efficiency() -> None:

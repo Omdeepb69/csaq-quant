@@ -128,7 +128,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="auto",
                    help="'auto', 'cpu', 'cuda', 'cuda:0', etc. (default: auto).")
     p.add_argument("--quiet", action="store_true", help="Suppress verbose output.")
-    p.add_argument("--version", action="version", version="csaq 0.5.0")
+    p.add_argument("--version", action="version", version="csaq 0.5.1")
 
     return p
 

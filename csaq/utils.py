@@ -189,7 +189,7 @@ def generate_csaq_report(
     )
 
     report: Dict[str, Any] = {
-        "csaq_version": "0.5.0",
+        "csaq_version": "0.5.1",
         "actual_avg_bits": round(info.get("actual_bits", 0.0), 4),
         "total_cliques": info.get("cliques_count", 0),
         "total_quantized_params": total_elems,
@@ -199,6 +199,10 @@ def generate_csaq_report(
         "ppl": info.get("ppl", "not_computed"),
         "calibration_domain": info.get("calibration_domain", "user_provided"),
         "salience_overlap_pct": info.get("overlap_pct", "not_computed"),
+        "memory_before_gb": info.get("memory_before_gb", "not_measured"),
+        "memory_after_gb": info.get("memory_after_gb", "not_measured"),
+        "memory_saved_gb": info.get("memory_saved_gb", "not_measured"),
+        "memory_saved_pct": info.get("memory_saved_pct", "not_measured"),
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
@@ -246,13 +250,25 @@ def export_csaq_model(
     except AttributeError:
         model_config_dict = {}
 
+    config.base_model_type = model_config_dict.get("model_type", "unknown")
+    config.base_model_name_or_path = model_config_dict.get("_name_or_path", model_config_dict.get("name_or_path", "unknown"))
+
     quant_config = config.to_dict()
     quant_config["quant_type"] = "csaq"
-    quant_config["csaq_version"] = "0.5.0"
-    model_config_dict["quantization_config"] = quant_config
+    quant_config["csaq_version"] = "0.5.1"
+    
+    model_config_dict["model_type"] = "csaq"
+    model_config_dict.update(quant_config)
+    if "quantization_config" in model_config_dict:
+        del model_config_dict["quantization_config"]
 
     with open(os.path.join(save_path, "config.json"), "w", encoding="utf-8") as f:
         json.dump(model_config_dict, f, indent=2)
+        
+    tokenizer_config_path = os.path.join(save_path, "tokenizer_config.json")
+    if not os.path.exists(tokenizer_config_path):
+        with open(tokenizer_config_path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
 
     # 2. csaq_manifest.json
     causal_map_s: Dict[str, Any] = {}
@@ -260,8 +276,13 @@ def export_csaq_model(
         for k, v in info.get("causal_map", {}).items():
             causal_map_s[k] = v if isinstance(v, list) else v.tolist()
 
+    layer_bits: Dict[str, int] = {}
+    for name, module in model.named_modules():
+        if isinstance(module, __import__("csaq.kernels", fromlist=["CSAQLinear"]).CSAQLinear):
+            layer_bits[name] = module.bits
+
     manifest: Dict[str, Any] = {
-        "csaq_version": "0.5.0",
+        "csaq_version": "0.5.1",
         "bit_distribution": info.get("tier_stats", {}) if info else {},
         "actual_avg_bits": info.get("actual_bits", 0.0) if info else 0.0,
         "cliques_count": info.get("cliques_count", 0) if info else 0,
@@ -270,6 +291,7 @@ def export_csaq_model(
         "bit_options": config.bit_options,
         "group_size": config.group_size,
         "calibration_domain": info.get("calibration_domain", "user_provided") if info else "user_provided",
+        "layer_bits": layer_bits,
     }
     with open(os.path.join(save_path, "csaq_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)

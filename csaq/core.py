@@ -239,6 +239,12 @@ class CausalProfiler:
         """
         cliques_per_layer: CliqueMap = {}
 
+        if self.config.clique_mode == "per_channel":
+            return {
+                name: [[i] for i in range(module.weight.shape[0])]
+                for name, module in self._modules.items()
+            }
+
         for name, module in self._modules.items():
             history = self._act_history[name]
             n_channels = module.weight.shape[0]
@@ -476,6 +482,15 @@ def quantize(
         calib_data, model, str(device), tokenizer=tokenizer, seq_len=seq_len
     )
 
+    def _measure_memory():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            return torch.cuda.memory_allocated() / 1024**3  # GB
+        import psutil, os
+        return psutil.Process(os.getpid()).memory_info().rss / 1024**3
+
+    mem_before = _measure_memory()
+
     # Phase 1+2
     if verbose:
         print("[CSAQ] Phase 1+2: Causal salience profiling & clique discovery")
@@ -502,8 +517,13 @@ def quantize(
         print("[CSAQ] Phase 3b: Applying quantisation & packing weights")
     causal_map = apply_csaq(model, budget, salience, config, verbose=verbose)
 
+    mem_after = _measure_memory()
+    saved = max(0, mem_before - mem_after)
+    pct = max(0, (mem_before - mem_after) / max(mem_before, 1e-6)) * 100
+
     elapsed = time.time() - t_start
     if verbose:
+        print(f"[CSAQ] Memory: {mem_before:.2f} GB → {mem_after:.2f} GB (saved {saved:.2f} GB, {pct:.1f}%)")
         print(f"\n[CSAQ] Pipeline complete in {elapsed:.1f}s\n")
 
     return model, {
@@ -514,4 +534,8 @@ def quantize(
         "cliques_count": cliques_count,
         "elapsed_s": elapsed,
         "calibration_domain": calibration_domain,
+        "memory_before_gb": round(mem_before, 3),
+        "memory_after_gb": round(mem_after, 3),
+        "memory_saved_gb": round(saved, 3),
+        "memory_saved_pct": round(pct, 1),
     }

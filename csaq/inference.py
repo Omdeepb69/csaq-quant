@@ -16,6 +16,7 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -50,6 +51,7 @@ class SpeculativeReport:
     total_wallclock_s: float = 0.0
     mode: str = "speculative"
     error_log: str = ""
+    _token_times: List[float] = field(default_factory=list)
 
     @property
     def acceptance_rate(self) -> float:
@@ -72,6 +74,18 @@ class SpeculativeReport:
         """Average accepted tokens per verify call."""
         return self.tokens_accepted / max(self.verify_calls, 1)
 
+    @property
+    def p95_latency_ms(self) -> float:
+        if not self._token_times:
+            return float("nan")
+        return float(np.percentile(self._token_times, 95)) * 1000.0
+
+    @property
+    def tokens_per_second(self) -> float:
+        if self.total_wallclock_s <= 0:
+            return 0.0
+        return self.tokens_generated / self.total_wallclock_s
+
     def summary(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
@@ -79,6 +93,8 @@ class SpeculativeReport:
             "acceptance_rate": round(self.acceptance_rate, 4),
             "speedup_factor": round(self.speedup_factor, 2),
             "inter_token_latency_ms": round(self.inter_token_latency_ms, 2),
+            "p95_latency_ms": round(self.p95_latency_ms, 2) if not np.isnan(self.p95_latency_ms) else "nan",
+            "tokens_per_second": round(self.tokens_per_second, 2),
             "block_efficiency": round(self.block_efficiency, 2),
             "draft_calls": self.draft_calls,
             "verify_calls": self.verify_calls,
@@ -406,6 +422,7 @@ class CSAQInferenceEngine:
         generated = input_ids.clone().to(self.device)
         past_key_values: Optional[Any] = None
         tokens_produced = 0
+        last_time = time.time()
 
         eos_id: Optional[int] = (
             self.tokenizer.eos_token_id if self.tokenizer else None
@@ -507,6 +524,13 @@ class CSAQInferenceEngine:
                 report.tokens_accepted += n_accepted
                 report.tokens_rejected += K - n_accepted
                 report.tokens_generated += n_accepted
+                
+                now = time.time()
+                dt = now - last_time
+                if n_accepted > 0:
+                    report._token_times.extend([dt / n_accepted] * n_accepted)
+                last_time = now
+
                 self.telemetry["total_tokens"] += n_accepted
                 self.telemetry["accepted_tokens"] += n_accepted
 

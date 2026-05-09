@@ -333,15 +333,40 @@ class CSAQLinear(nn.Module):
         self.bits = bits
         self.group_size = group_size
 
-        # Placeholders — filled by from_cliques
-        self.register_buffer("weight_packed", torch.zeros(1, dtype=torch.uint8))
-        self.register_buffer("weight_scales", torch.ones(out_features, dtype=torch.float32))
-        self.register_buffer("weight_zp", torch.zeros(out_features, dtype=torch.int32))
+        if bits == 16:
+            cols_packed = in_features * 2
+        elif bits == 8:
+            cols_packed = in_features
+        elif bits == 4:
+            cols_packed = (in_features + 1) // 2
+        elif bits == 2:
+            cols_packed = (in_features + 3) // 4
+        else:
+            cols_packed = 1
+            
+        n_groups = 1 if group_size == -1 else (in_features + group_size - 1) // group_size
+
+        self.register_buffer("weight_packed", torch.zeros(out_features, cols_packed, dtype=torch.uint8))
+        if n_groups == 1:
+            self.register_buffer("weight_scales", torch.ones(out_features, dtype=torch.float32))
+            self.register_buffer("weight_zp", torch.zeros(out_features, dtype=torch.int32))
+        else:
+            self.register_buffer("weight_scales", torch.ones(out_features, n_groups, dtype=torch.float32))
+            self.register_buffer("weight_zp", torch.zeros(out_features, n_groups, dtype=torch.int32))
 
         if bias is not None:
             self.register_buffer("bias", bias.detach().clone())
         else:
             self.bias = None  # type: ignore[assignment]
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        for attr in ["weight_packed", "weight_scales", "weight_zp", "_csaq_fp16_backup", "_csaq_quant_stash", "_csaq_hi_rows"]:
+            key = f"{prefix}{attr}"
+            if key in state_dict:
+                current_tensor = getattr(self, attr, None)
+                if current_tensor is not None and current_tensor.shape != state_dict[key].shape:
+                    current_tensor.resize_(state_dict[key].shape)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     @classmethod
     def from_cliques(

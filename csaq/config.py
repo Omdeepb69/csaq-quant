@@ -8,7 +8,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, AutoConfig
 
 
 # Valid bit widths that have real storage representations in PyTorch / packed int8.
@@ -64,9 +64,14 @@ class CSAQConfig(PretrainedConfig):
         salience_alpha: float = 1.0,
         protection_floor: float = 0.10,
         group_size: int = -1,
+        clique_mode: str = "jaccard",
+        base_model_type: str = "",
+        base_model_name_or_path: str = "",
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)
+        self.base_model_type = base_model_type
+        self.base_model_name_or_path = base_model_name_or_path
 
         # ── Bit options ─────────────────────────────────────────────────────
         if bit_options is None:
@@ -96,10 +101,13 @@ class CSAQConfig(PretrainedConfig):
             )
 
         # ── Threshold / fraction validation ──────────────────────────────────
-        if not (0.0 < clique_threshold <= 1.0):
-            raise ValueError("[CSAQConfig] clique_threshold must be in (0, 1].")
+        if not (0.0 <= clique_threshold <= 1.0):
+            raise ValueError("[CSAQConfig] clique_threshold must be in [0, 1].")
         if not (0.0 <= protection_floor < 1.0):
             raise ValueError("[CSAQConfig] protection_floor must be in [0, 1).")
+
+        if clique_mode not in ("jaccard", "per_channel"):
+            raise ValueError("[CSAQConfig] clique_mode must be 'jaccard' or 'per_channel'.")
 
         self.target_bits = target_bits
         self.bit_options = bit_options
@@ -110,6 +118,7 @@ class CSAQConfig(PretrainedConfig):
         self.salience_alpha = salience_alpha
         self.protection_floor = protection_floor
         self.group_size = group_size
+        self.clique_mode = clique_mode
 
     # ── Convenience properties ────────────────────────────────────────────────
 
@@ -121,10 +130,12 @@ class CSAQConfig(PretrainedConfig):
     def max_bits(self) -> int:
         return max(self.bit_options)
 
-    def __repr__(self) -> str:  # pragma: no cover
+    def extra_repr(self) -> str:  # pragma: no cover
         return (
             f"CSAQConfig(target_bits={self.target_bits}, "
             f"bit_options={self.bit_options}, "
             f"clique_threshold={self.clique_threshold}, "
             f"group_size={self.group_size})"
         )
+
+AutoConfig.register("csaq", CSAQConfig)

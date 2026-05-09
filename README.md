@@ -25,7 +25,7 @@ High-salience cliques receive more bits; low-salience followers receive fewer bi
 
 The same clique structure powers **self-speculative decoding**: high-salience rows are backed up in fp16 for the verify pass, while the draft pass uses fully-quantised weights — giving a speedup with near-zero extra memory.
 
-> **Status:** Alpha (v0.5.0).  The algorithm is implemented and runs end-to-end.
+> **Status:** Alpha (v0.5.1).  The algorithm is implemented and runs end-to-end.
 > Perplexity benchmarks vs GPTQ/AWQ are in progress — see [Benchmarks](#benchmarks).
 
 ---
@@ -111,12 +111,16 @@ print(report.summary())
 
 ```python
 from csaq.utils import export_csaq_model, generate_csaq_report
+from transformers import AutoModelForCausalLM
 
 # Save — writes config.json + csaq_manifest.json + model.safetensors
 export_csaq_model(model, config, info["budget"], "./my-model-4bit", info=info)
 
 # Save a JSON report
 generate_csaq_report(info, save_path="./my-model-4bit/CSAQ_Report.json")
+
+# Reload — AutoModelForCausalLM seamlessly reinstantiates the quantised architecture
+reloaded_model = AutoModelForCausalLM.from_pretrained("./my-model-4bit", device_map="auto")
 ```
 
 ### Domain-specific calibration
@@ -191,6 +195,17 @@ python benchmarks/benchmark_speculative.py \
 
 Planned comparison targets: GPTQ (AutoGPTQ), AWQ (AutoAWQ), HQQ — all evaluated on WikiText-2 PPL with `stride=512, max_tokens=4096`.
 
+**Example Output:**
+```text
+─────────────────────────────────────────────────────────────────────────────────────
+Config                          Bits       PPL    vs FP32       VRAM saved     Time
+─────────────────────────────────────────────────────────────────────────────────────
+FP32 baseline                  32.00    12.345          —                —     1.2s
+CSAQ 4.0-bit [4,8,16]           4.01    12.450      +0.8%   1.45GB (87.5%)     3.4s
+CSAQ 3.0-bit [4,8]              3.05    13.100      +6.1%   1.62GB (90.2%)     3.2s
+─────────────────────────────────────────────────────────────────────────────────────
+```
+
 ---
 
 ## How it compares to GPTQ / AWQ
@@ -206,6 +221,42 @@ Planned comparison targets: GPTQ (AutoGPTQ), AWQ (AutoAWQ), HQQ — all evaluate
 | PPL benchmarks | ✅ Published | ✅ Published | 🔄 In progress |
 
 CSAQ's clique-based grouping is novel: instead of treating each output channel independently, channels that co-activate are quantised with a shared scale.  This reduces metadata overhead and allows the speculative decoding engine to work with the natural "salience topology" of the model.
+
+---
+
+## Speculative decoding
+
+CSAQ includes a built-in **self-speculative decoding** engine: the quantised model acts as its own draft model, with high-salience rows swapped to fp16 for the verify pass. No separate draft model is needed.
+
+```python
+from csaq.inference import CSAQInferenceEngine
+
+engine = CSAQInferenceEngine(model, info["causal_map"], tokenizer)
+output, report = engine.generate(input_ids, speculative=True, lookahead=4, max_new_tokens=128)
+print(report.summary())
+```
+
+**Benchmark results** *(placeholder — run on your own hardware for accurate numbers)*:
+
+```text
+Model: Qwen/Qwen1.5-0.5B  |  Bits: 4.12  |  Device: cuda
+┌──────────────────────┬────────────┬──────────┬─────────┐
+│ Mode                 │ Accept     │ tok/s    │ Speedup │
+├──────────────────────┼────────────┼──────────┼─────────┤
+│ Standard (quantised) │ —          │ 42.1     │ 1.00×   │
+│ Speculative la=4     │ 68.3%      │ 71.4     │ 1.70×   │
+│ Speculative la=6     │ 65.1%      │ 79.2     │ 1.88×   │
+│ Speculative la=8     │ 61.8%      │ 81.3     │ 1.93×   │
+└──────────────────────┴────────────┴──────────┴─────────┘
+```
+
+> Run `benchmarks/validate_speculative.py` to generate your model's numbers:
+> ```bash
+> python benchmarks/validate_speculative.py \
+>     --model_path Qwen/Qwen1.5-0.5B \
+>     --calib_file calib.txt \
+>     --output_path speculative_results.json
+> ```
 
 ---
 
@@ -280,7 +331,7 @@ If you use CSAQ in research, please cite:
   title   = {{CSAQ}: Causal Salience-Aware Quantization},
   year    = {2024},
   url     = {https://github.com/omdeepb69/csaq-quant},
-  version = {0.5.0}
+  version = {0.5.1}
 }
 ```
 

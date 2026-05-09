@@ -134,9 +134,11 @@ def test_export_config_json_has_quant_config(tiny_model, config, sample_info) ->
         with open(os.path.join(tmpdir, "config.json"), encoding="utf-8") as f:
             cfg_dict = json.load(f)
 
-        assert "quantization_config" in cfg_dict
-        assert cfg_dict["quantization_config"]["quant_type"] == "csaq"
-        assert cfg_dict["quantization_config"]["target_bits"] == 4.0
+        # Quant fields are flattened into config root (not nested under quantization_config)
+        # for HF AutoModel compatibility
+        assert cfg_dict.get("quant_type") == "csaq"
+        assert cfg_dict.get("target_bits") == 4.0
+        assert cfg_dict.get("model_type") == "csaq"
 
 
 def test_export_manifest_schema(tiny_model, config, sample_info) -> None:

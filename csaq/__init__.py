@@ -33,8 +33,12 @@ from .utils import (
     export_csaq_model,
     generate_csaq_report,
 )
+from .modeling import CSAQModelForCausalLM
+from transformers import AutoModelForCausalLM
 
-__version__ = "0.5.0"
+AutoModelForCausalLM.register(CSAQConfig, CSAQModelForCausalLM)
+
+__version__ = "0.5.1"
 __author__ = "Omdeep Borkar"
 __email__ = "omdeepborkar@gmail.com"
 
