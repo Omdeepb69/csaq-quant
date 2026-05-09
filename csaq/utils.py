@@ -1,5 +1,9 @@
 """
 csaq/utils.py — Calibration data, evaluation, reporting, and model export.
+
+Design principle: NO default dataset is assumed.  The caller always provides
+``custom_texts``.  This ensures quantisation reflects the actual target domain —
+Konkani, medical text, code, or anything else — not English Wikipedia.
 """
 
 from __future__ import annotations
@@ -7,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import warnings
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -20,71 +24,60 @@ import torch.nn as nn
 
 def build_calibration_data(
     tokenizer: Any,
-    n: int = 64,
+    custom_texts: List[str],
+    n: Optional[int] = None,
     seq_len: int = 128,
-    dataset: str = "wikitext",
     device: str = "cpu",
-    hard: bool = False,
-    custom_texts: Optional[List[str]] = None,
 ) -> List[Dict[str, torch.Tensor]]:
     """
-    Build a tokenised calibration dataset for CSAQ profiling.
+    Build a tokenised calibration dataset from **your own texts**.
+
+    There is intentionally no default dataset.  The salience map is only
+    meaningful relative to the domain you care about.  If you quantise a
+    Konkani model using English Wikipedia as calibration, CSAQ will protect
+    English-important weights, not Konkani ones.
 
     Args:
-        tokenizer:    Any HuggingFace tokenizer with a ``__call__`` method.
-        n:            Number of calibration samples.
-        seq_len:      Sequence length to truncate/pad to.
-        dataset:      ``"wikitext"`` (default) for general English;
-                      ``"hard"`` for a mix of MATH + HumanEval + WikiText.
-        device:       Device to place tensors on.
-        hard:         If ``True``, override ``dataset`` with hard-domain data.
-        custom_texts: If provided, tokenise these strings instead of loading
-                      any public dataset.  Useful for domain-adapted quantisation.
+        tokenizer:    Any HuggingFace tokenizer.
+        custom_texts: List of strings in your target language/domain.
+                      Recommended minimum: 64 samples of >= 50 tokens each.
+        n:            If set, use only the first ``n`` texts.
+                      Defaults to all texts supplied.
+        seq_len:      Token length to truncate/pad each sample to.
+        device:       PyTorch device string (``"cpu"``, ``"cuda"``, etc.).
 
     Returns:
         List of dicts ``{"input_ids": Tensor, "attention_mask": Tensor}``.
-    """
-    # User-supplied texts take priority
-    if custom_texts is not None:
-        return _tokenise_texts(tokenizer, custom_texts[:n], seq_len, device)
 
-    texts: List[str] = []
+    Konkani example::
 
-    if hard or dataset == "hard":
-        texts = _load_hard_texts(n)
-
-    if not texts:
-        texts = _load_wikitext(n)
-
-    return _tokenise_texts(tokenizer, texts[:n], seq_len, device)
-
-
-def _load_wikitext(n: int) -> List[str]:
-    from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-    return [t for t in ds["text"] if len(t.strip()) > 80][:n]
-
-
-def _load_hard_texts(n: int) -> List[str]:
-    texts: List[str] = []
-    try:
-        from datasets import load_dataset
-        ds = load_dataset("hendrycks/competition_math", "main", split="test")
-        texts += [
-            f"Problem: {x['problem']}\nSolution: {x['solution']}"
-            for x in list(ds)[: n // 3]
+        texts = [
+            "आमी कोंकणी उलयतात.",
+            "कोंकणी भाशा भारताची राष्ट्रीय भाशा.",
+            # ... at least 64 sentences recommended
         ]
-    except Exception:
-        pass
-    try:
-        from datasets import load_dataset
-        ds = load_dataset("openai_humaneval", split="test")
-        texts += [x["prompt"] for x in list(ds)[: n // 3]]
-    except Exception:
-        pass
-    if len(texts) < n:
-        texts += _load_wikitext(n - len(texts))
-    return texts
+        calib = build_calibration_data(tokenizer, custom_texts=texts)
+        model, info = quantize(model, calib, config=config)
+    """
+    if not custom_texts:
+        raise ValueError(
+            "[CSAQ] custom_texts is empty.\n"
+            "Provide sentences in your target language/domain.\n"
+            "Example:\n"
+            "  calib = build_calibration_data(tokenizer,\n"
+            "              custom_texts=['Your sentence 1', 'Your sentence 2', ...])"
+        )
+
+    texts = list(custom_texts) if n is None else list(custom_texts)[:n]
+
+    if len(texts) < 16:
+        warnings.warn(
+            f"[CSAQ] Only {len(texts)} calibration samples supplied. "
+            "Salience estimates will be noisy. Recommended minimum: 64.",
+            stacklevel=2,
+        )
+
+    return _tokenise_texts(tokenizer, texts, seq_len, device)
 
 
 def _tokenise_texts(
@@ -113,35 +106,39 @@ def _tokenise_texts(
 def compute_perplexity(
     model: nn.Module,
     tokenizer: Any,
-    dataset: str = "wikitext2",
+    eval_texts: List[str],
     max_tokens: int = 4096,
     stride: int = 512,
     seq_len: int = 128,
     device: str = "cpu",
 ) -> float:
     """
-    Compute perplexity on WikiText-2 test split using a sliding-window approach.
+    Compute perplexity on **your own evaluation texts**.
 
-    This is the standard PPL evaluation used by GPTQ, AWQ, and HQQ for fair
-    comparison.  Use ``max_tokens=4096`` and ``stride=512`` to match their
-    reported numbers.
+    No dataset is loaded automatically.  Pass texts in the language/domain
+    you are evaluating.  For comparison with GPTQ/AWQ published numbers,
+    pass WikiText-2 test texts explicitly.  For Konkani evaluation, pass
+    Konkani test sentences.
+
+    The texts are joined with ``"\\n\\n"`` and evaluated with a sliding window
+    — the standard protocol used in GPTQ, AWQ, and HQQ papers.
 
     Args:
-        model:      Quantised (or baseline) model.
-        tokenizer:  Matching HuggingFace tokenizer.
-        dataset:    Currently ``"wikitext2"`` (more datasets planned).
-        max_tokens: Total tokens to evaluate over.
-        stride:     Stride of the sliding window.
-        seq_len:    Window size (context length per chunk).
-        device:     Evaluation device.
+        model:       Model to evaluate (quantised or baseline).
+        tokenizer:   Matching HuggingFace tokenizer.
+        eval_texts:  List of evaluation strings in your target domain.
+        max_tokens:  Total tokens to evaluate across the joined text.
+        stride:      Sliding-window stride (512 matches GPTQ/AWQ protocol).
+        seq_len:     Window/chunk size.
+        device:      Evaluation device.
 
     Returns:
-        Perplexity score (lower is better).
+        Perplexity (lower is better).
     """
-    from datasets import load_dataset
+    if not eval_texts:
+        raise ValueError("[CSAQ] eval_texts is empty.")
 
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    text = "\n\n".join(ds["text"])
+    text = "\n\n".join(eval_texts)
     enc = tokenizer(text, return_tensors="pt")
     inp = enc.input_ids[:, :max_tokens].to(device)
 
@@ -158,7 +155,7 @@ def compute_perplexity(
                 if not torch.isnan(loss) and not torch.isinf(loss):
                     nlls.append(loss.item())
             except Exception as exc:
-                warnings.warn(f"[CSAQ] PPL eval chunk {begin}-{end} failed: {exc}")
+                warnings.warn(f"[CSAQ] PPL chunk {begin}-{end} failed: {exc}")
 
     if not nlls:
         return float("inf")
@@ -174,25 +171,22 @@ def generate_csaq_report(
     save_path: str = "./CSAQ_Report.json",
 ) -> Dict[str, Any]:
     """
-    Generate and save a JSON report from quantisation ``info`` dict.
-
-    The report follows a stable schema so downstream tooling can parse it
-    reliably.  Unknown keys in ``info`` are forwarded under ``"extra"``.
+    Generate and save a JSON report from the quantisation ``info`` dict.
 
     Args:
-        info:      The second return value from :func:`~csaq.core.quantize`.
+        info:      Second return value from :func:`~csaq.core.quantize`.
         save_path: Output path for the JSON file.
 
     Returns:
         The report dict (also written to disk).
     """
     tier_stats = info.get("tier_stats", {})
-    total_elems = sum(tier_stats.values()) if tier_stats else 1
+    total_elems = sum(tier_stats.values()) if tier_stats else 0
 
-    pct: Dict[str, float] = {
-        t: round(100.0 * count / total_elems, 2)
-        for t, count in tier_stats.items()
-    }
+    pct: Dict[str, float] = (
+        {t: round(100.0 * c / total_elems, 2) for t, c in tier_stats.items()}
+        if total_elems > 0 else {}
+    )
 
     report: Dict[str, Any] = {
         "csaq_version": "0.5.0",
@@ -202,8 +196,9 @@ def generate_csaq_report(
         "elapsed_seconds": round(info.get("elapsed_s", 0.0), 2),
         "bit_distribution": tier_stats,
         "bit_distribution_pct": pct,
+        "ppl": info.get("ppl", "not_computed"),
+        "calibration_domain": info.get("calibration_domain", "user_provided"),
         "salience_overlap_pct": info.get("overlap_pct", "not_computed"),
-        "pareto_efficiency": info.get("pareto_score", "not_computed"),
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
@@ -220,33 +215,23 @@ def generate_csaq_report(
 
 def export_csaq_model(
     model: nn.Module,
-    config: Any,        # CSAQConfig
-    budget: Any,        # BudgetMap (optional, for manifest)
+    config: Any,
+    budget: Any,
     save_path: str,
     info: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Export a quantised CSAQ model to disk in a HuggingFace-compatible format.
 
-    Layout::
+    Output layout::
 
         save_path/
             config.json          ← model + quantisation config (merged)
             csaq_manifest.json   ← clique metadata, version, bit stats
             model.safetensors    ← packed weight buffers
 
-    The ``config.json`` includes a ``quantization_config`` block so that
-    :class:`transformers.AutoModelForCausalLM` can detect the quantisation
-    format.  A CSAQ-aware loader can then reconstruct ``CSAQLinear`` layers
-    from the packed buffers.
-
-    Args:
-        model:     Quantised model (with ``CSAQLinear`` layers).
-        config:    :class:`~csaq.CSAQConfig` used during quantisation.
-        budget:    Clique budget map from ``info["budget"]``.
-        save_path: Directory to write files into.
-        info:      Full ``info`` dict from :func:`~csaq.core.quantize`
-                   (used for manifest metadata).
+    The ``config.json`` contains a ``quantization_config`` block so that
+    HuggingFace ``AutoModelForCausalLM`` can detect the quantisation format.
 
     Returns:
         Absolute path to the saved directory.
@@ -255,8 +240,7 @@ def export_csaq_model(
 
     os.makedirs(save_path, exist_ok=True)
 
-    # ── 1. config.json ─────────────────────────────────────────────────────
-    # Merge model config + quantisation config for HF compatibility
+    # 1. config.json
     try:
         model_config_dict = model.config.to_dict()
     except AttributeError:
@@ -265,41 +249,37 @@ def export_csaq_model(
     quant_config = config.to_dict()
     quant_config["quant_type"] = "csaq"
     quant_config["csaq_version"] = "0.5.0"
-
-    # HF convention: quantisation_config is a nested key
     model_config_dict["quantization_config"] = quant_config
 
     with open(os.path.join(save_path, "config.json"), "w", encoding="utf-8") as f:
         json.dump(model_config_dict, f, indent=2)
 
-    # ── 2. csaq_manifest.json ──────────────────────────────────────────────
-    causal_map_serialisable: Dict[str, Any] = {}
+    # 2. csaq_manifest.json
+    causal_map_s: Dict[str, Any] = {}
     if info:
-        raw_cmap = info.get("causal_map", {})
-        for k, v in raw_cmap.items():
-            causal_map_serialisable[k] = v if isinstance(v, list) else v.tolist()
+        for k, v in info.get("causal_map", {}).items():
+            causal_map_s[k] = v if isinstance(v, list) else v.tolist()
 
     manifest: Dict[str, Any] = {
         "csaq_version": "0.5.0",
         "bit_distribution": info.get("tier_stats", {}) if info else {},
         "actual_avg_bits": info.get("actual_bits", 0.0) if info else 0.0,
         "cliques_count": info.get("cliques_count", 0) if info else 0,
-        "causal_map": causal_map_serialisable,
+        "causal_map": causal_map_s,
         "target_bits": config.target_bits,
         "bit_options": config.bit_options,
         "group_size": config.group_size,
+        "calibration_domain": info.get("calibration_domain", "user_provided") if info else "user_provided",
     }
-    with open(
-        os.path.join(save_path, "csaq_manifest.json"), "w", encoding="utf-8"
-    ) as f:
+    with open(os.path.join(save_path, "csaq_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    # ── 3. model.safetensors ───────────────────────────────────────────────
-    # Non-persistent buffers (fp16 backups for speculative decoding) are
-    # intentionally excluded from state_dict and won't be saved here.
+    # 3. model.safetensors — exclude non-persistent speculative buffers
     state_dict = {
         k: v for k, v in model.state_dict().items()
-        if not k.endswith(("_csaq_fp16_backup", "_csaq_quant_stash", "_csaq_hi_rows"))
+        if not any(k.endswith(s) for s in (
+            "_csaq_fp16_backup", "_csaq_quant_stash", "_csaq_hi_rows"
+        ))
     }
     safetensors.torch.save_file(
         state_dict,
@@ -308,5 +288,4 @@ def export_csaq_model(
 
     abs_path = os.path.abspath(save_path)
     print(f"[CSAQ] Model exported → {abs_path}")
-    print(f"         config.json, csaq_manifest.json, model.safetensors")
     return abs_path

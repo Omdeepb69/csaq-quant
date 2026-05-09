@@ -8,7 +8,6 @@ Phase 3: Fractional bit-budget constraint solving + weight application
 
 from __future__ import annotations
 
-import math
 import time
 import warnings
 from collections import defaultdict
@@ -20,10 +19,7 @@ import torch.nn as nn
 from .config import CSAQConfig
 from .kernels import (
     CSAQLinear,
-    QuantizedWeight,
     inject_csaq_linear,
-    quantize_per_channel,
-    quantize_shared_scale,
     _get_submodule,
 )
 
@@ -32,12 +28,9 @@ from .kernels import (
 # Types
 # ─────────────────────────────────────────────────────────────────────────────
 
-# layer_name → list of clique dicts
-BudgetMap = Dict[str, List[Dict[str, Any]]]
-# layer_name → salience tensor (out_features, in_features)
+BudgetMap  = Dict[str, List[Dict[str, Any]]]
 SalienceMap = Dict[str, torch.Tensor]
-# layer_name → list of row-index lists
-CliqueMap = Dict[str, List[List[int]]]
+CliqueMap  = Dict[str, List[List[int]]]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,13 +41,17 @@ def _prepare_calib_data(
     calib_data: Union[List[Dict[str, torch.Tensor]], List[str]],
     model: nn.Module,
     device: str = "cpu",
+    tokenizer: Any = None,
+    seq_len: int = 128,
 ) -> List[Dict[str, torch.Tensor]]:
     """
     Normalise calibration data to a list of tokenised batches.
 
     Accepts:
         - List of pre-tokenised dicts (``{"input_ids": ..., "attention_mask": ...}``)
-        - List of raw strings (will be tokenised using the model's tokenizer)
+        - List of raw strings — requires ``tokenizer`` to be passed explicitly.
+          No tokenizer is auto-loaded; if none is provided and strings are
+          passed, a ValueError is raised.
     """
     if not calib_data:
         raise ValueError("[CSAQ] calib_data is empty.")
@@ -69,17 +66,18 @@ def _prepare_calib_data(
         return validated
 
     if isinstance(calib_data[0], str):
-        from transformers import AutoTokenizer
-        m_name = getattr(getattr(model, "config", None), "_name_or_path", "gpt2")
-        tokenizer = AutoTokenizer.from_pretrained(m_name, use_fast=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        if tokenizer is None:
+            raise ValueError(
+                "[CSAQ] calib_data contains raw strings but no tokenizer was "
+                "provided.  Pass tokenizer= to quantize(), or pre-tokenise "
+                "your texts using build_calibration_data() before calling quantize()."
+            )
         batches: List[Dict[str, torch.Tensor]] = []
         for text in calib_data:
             enc = tokenizer(
                 str(text),
                 return_tensors="pt",
-                max_length=128,
+                max_length=seq_len,
                 truncation=True,
                 padding="max_length",
             )
@@ -114,16 +112,15 @@ class CausalProfiler:
     Jaccard co-activation graph to find cliques of weight rows that
     fire together across calibration samples.
 
-    Early stopping: once the Spearman rank correlation of accumulated
-    salience between consecutive checkpoints exceeds 0.99, the ordering
-    is considered stable and profiling halts — saving significant compute
-    for large datasets.
+    Early stopping: once Spearman rank correlation of accumulated salience
+    between consecutive checkpoints exceeds 0.99, the ordering is stable
+    and profiling halts — saving compute for large datasets.
     """
 
     _EARLY_STOP_RHO: float = 0.99
     _EARLY_STOP_MIN_BATCHES: int = 16
-    _EVAL_STRIDE: int = 8          # check Spearman every N batches
-    _SPEARMAN_SAMPLE: int = 50_000  # subsample for fast rank correlation
+    _EVAL_STRIDE: int = 8
+    _SPEARMAN_SAMPLE: int = 50_000
 
     def __init__(self, model: nn.Module, config: CSAQConfig) -> None:
         self.model = model
@@ -165,8 +162,8 @@ class CausalProfiler:
         verbose: bool = True,
     ) -> Tuple[SalienceMap, CliqueMap]:
         """
-        Run calibration forward+backward passes to accumulate salience and
-        activation co-occurrence data.
+        Run calibration forward+backward passes to accumulate salience
+        and activation co-occurrence.
 
         Returns:
             Tuple of (salience_map, clique_map).
@@ -186,7 +183,7 @@ class CausalProfiler:
                 disable=not verbose,
             )
         except ImportError:
-            data_iter = enumerate(calib_data)
+            data_iter = enumerate(calib_data)  # type: ignore[assignment]
 
         for i, batch in data_iter:
             actual_batches += 1
@@ -227,7 +224,6 @@ class CausalProfiler:
                         break
                 prev_ranks = ranks.clone()
 
-        # Normalise by batches processed
         for name in self.salience:
             self.salience[name] = self.salience[name] / max(actual_batches, 1)
 
@@ -238,11 +234,8 @@ class CausalProfiler:
 
     def _build_cliques(self) -> CliqueMap:
         """
-        Greedily partition each layer's output channels into cliques using
-        Jaccard similarity of their activation masks.
-
-        Online bit-vector accumulation keeps memory O(channels²) per layer,
-        not O(channels × samples).
+        Partition each layer's output channels into cliques using Jaccard
+        similarity of their activation masks.
         """
         cliques_per_layer: CliqueMap = {}
 
@@ -254,13 +247,12 @@ class CausalProfiler:
                 cliques_per_layer[name] = [[i] for i in range(n_channels)]
                 continue
 
-            # Accumulate intersection and union counts using float32
-            mask = torch.cat(history, dim=0).float()   # (N_samples, channels)
-            intersect = torch.matmul(mask.t(), mask)   # (C, C)
-            f = mask.sum(dim=0)                        # (C,)
+            mask = torch.cat(history, dim=0).float()
+            intersect = torch.matmul(mask.t(), mask)
+            f = mask.sum(dim=0)
             union = (f.unsqueeze(1) + f.unsqueeze(0) - intersect).clamp(min=1.0)
-            jaccard = intersect / union                # (C, C)
-            self._act_history[name] = []               # free memory
+            jaccard = intersect / union
+            self._act_history[name] = []
 
             threshold = self.config.clique_threshold
             visited = torch.zeros(n_channels, dtype=torch.bool)
@@ -290,16 +282,7 @@ def solve_clique_budget(
     config: CSAQConfig,
 ) -> Tuple[BudgetMap, Dict[str, int], float]:
     """
-    Assign a bit-width to each clique such that the average bits-per-weight
-    across the whole model is ≤ config.target_bits.
-
-    Strategy
-    ────────
-    1. Start every clique at the minimum bit option.
-    2. Apply the protection floor: force top-p% of salient cliques to ≥ 8-bit.
-    3. Greedy upgrade: iterate cliques by descending salience density
-       (salience / elements) and promote to the next bit tier whenever the
-       additional bit cost fits within the remaining budget.
+    Assign a bit-width to each clique to hit config.target_bits on average.
 
     Returns:
         (budget_map, tier_stats, actual_avg_bits)
@@ -311,7 +294,7 @@ def solve_clique_budget(
     for name, layer_cliques in cliques.items():
         s_ten = salience[name]
         for c in layer_cliques:
-            row_sal = s_ten[c].sum(dim=1)       # (clique_size,)
+            row_sal = s_ten[c].sum(dim=1)
             leader_idx = row_sal.argmax().item()
             all_cliques.append({
                 "layer": name,
@@ -329,10 +312,9 @@ def solve_clique_budget(
     current_bits = sum(c["elems"] * c["bits"] for c in all_cliques)
     target_total = config.target_bits * total_elems
 
-    # Sort by salience density (descending) — highest value cliques upgraded first
     all_cliques.sort(key=lambda x: x["salience"] / max(x["elems"], 1), reverse=True)
 
-    # Protection floor: top protection_floor fraction of cliques → min 8-bit
+    # Protection floor: top fraction always gets >= 8-bit
     n_protect = max(1, int(config.protection_floor * len(all_cliques)))
     for c in all_cliques[:n_protect]:
         floor_bits = max(c["bits"], min(8, max(options)))
@@ -355,7 +337,6 @@ def solve_clique_budget(
 
     actual_avg_bits = current_bits / max(total_elems, 1)
 
-    # Assemble budget map
     budget: BudgetMap = defaultdict(list)
     tier_stats: Dict[str, int] = defaultdict(int)
     for c in all_cliques:
@@ -377,23 +358,14 @@ def apply_csaq(
     verbose: bool = True,
 ) -> Dict[str, List[int]]:
     """
-    Apply quantisation to the model in two steps:
-
-    1. Replace ``nn.Linear`` layers with ``CSAQLinear`` (packed storage).
-       This is what actually saves memory — the original fp32 weight tensor
-       is freed and replaced with a packed uint8 buffer.
-
-    2. Register fp16 backups for high-salience rows so the speculative
-       decoding engine can swap between draft (quantised) and verify (fp16)
-       weights without a full dequantisation pass.
+    Replace nn.Linear layers with CSAQLinear (packed storage) and register
+    fp16 backups for high-salience rows (used by speculative decoding).
 
     Returns:
-        causal_map: dict mapping layer names to lists of protected row indices.
+        causal_map: layer name → list of protected row indices.
     """
-    # Step 1: inject CSAQLinear — real packing happens here
     model = inject_csaq_linear(model, budget, verbose=verbose)
 
-    # Step 2: register speculative-decoding buffers on the new CSAQLinear layers
     causal_map: Dict[str, List[int]] = {}
 
     for mod_name, layer_cliques in budget.items():
@@ -403,31 +375,27 @@ def apply_csaq(
         if mod_name not in salience:
             continue
 
-        row_sal = salience[mod_name].sum(dim=1)  # (out_features,)
+        row_sal = salience[mod_name].sum(dim=1)
         n_out = module.out_features
         n_protect = max(1, int(config.protection_floor * n_out))
         top_rows = row_sal.topk(n_protect).indices.sort().values
 
-        # Dequantise just these rows into fp16 for the verify-pass backup
         W_fp32 = module._get_weight_fp32()
         fp16_backup = W_fp32[top_rows].to(torch.float16).detach().contiguous()
-        quant_stash = W_fp32[top_rows].detach().contiguous()  # already quantised fp32
+        quant_stash = W_fp32[top_rows].detach().contiguous()
 
-        module.register_buffer(
-            "_csaq_hi_rows", top_rows, persistent=False
-        )
-        module.register_buffer(
-            "_csaq_fp16_backup", fp16_backup, persistent=False
-        )
-        module.register_buffer(
-            "_csaq_quant_stash", quant_stash, persistent=False
-        )
+        module.register_buffer("_csaq_hi_rows", top_rows, persistent=False)
+        module.register_buffer("_csaq_fp16_backup", fp16_backup, persistent=False)
+        module.register_buffer("_csaq_quant_stash", quant_stash, persistent=False)
 
         causal_map[mod_name] = top_rows.tolist()
 
     if verbose:
         n_protected = sum(len(v) for v in causal_map.values())
-        print(f"[CSAQ] Protected {n_protected} rows across {len(causal_map)} layers for speculative decoding.")
+        print(
+            f"[CSAQ] Protected {n_protected} rows across "
+            f"{len(causal_map)} layers for speculative decoding."
+        )
 
     return causal_map
 
@@ -441,29 +409,35 @@ def quantize(
     calib_data: Union[List[Dict[str, torch.Tensor]], List[str]],
     config: Optional[CSAQConfig] = None,
     verbose: bool = True,
+    tokenizer: Any = None,
+    seq_len: int = 128,
+    calibration_domain: str = "user_provided",
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Run the full CSAQ three-phase quantisation pipeline.
 
     Args:
-        model:      A HuggingFace ``PreTrainedModel`` (or any ``nn.Module``
-                    with ``nn.Linear`` layers and a ``model.forward(labels=...)``
-                    that returns a loss).
-        calib_data: Calibration samples — either pre-tokenised dicts
-                    ``{"input_ids": Tensor, "attention_mask": Tensor}`` or
-                    a list of raw strings.
-        config:     :class:`~csaq.CSAQConfig`. Defaults to 4.0-bit target.
-        verbose:    Print progress information.
+        model:              A HuggingFace ``PreTrainedModel`` (or any
+                            ``nn.Module`` with ``nn.Linear`` layers).
+        calib_data:         Calibration samples — pre-tokenised dicts
+                            ``{"input_ids": Tensor}`` or raw strings.
+                            Build these with :func:`~csaq.utils.build_calibration_data`.
+        config:             :class:`~csaq.CSAQConfig`. Defaults to 4-bit.
+        verbose:            Print progress.
+        tokenizer:          Required only if ``calib_data`` is List[str].
+        seq_len:            Sequence length when tokenising raw strings.
+        calibration_domain: Label stored in the report (e.g. ``"konkani"``).
 
     Returns:
         ``(quantized_model, info_dict)`` where ``info_dict`` contains:
 
-        * ``tier_stats``    — dict mapping "int4" / "int8" etc. to element count
-        * ``budget``        — the full clique budget map (for inspection)
-        * ``causal_map``    — layer → protected row indices (for speculative decoding)
-        * ``actual_bits``   — achieved average bits-per-weight
-        * ``cliques_count`` — total number of weight cliques discovered
-        * ``elapsed_s``     — total pipeline wall-clock time
+        * ``tier_stats``        — dict mapping "int4"/"int8" to element count
+        * ``budget``            — full clique budget map
+        * ``causal_map``        — layer → protected row indices
+        * ``actual_bits``       — achieved average bits-per-weight
+        * ``cliques_count``     — total cliques discovered
+        * ``elapsed_s``         — pipeline wall-clock time
+        * ``calibration_domain``— domain label passed in
     """
     if config is None:
         config = CSAQConfig()
@@ -473,16 +447,16 @@ def quantize(
     if verbose:
         print(f"\n{'='*60}")
         print(f"  CSAQ Quantization Pipeline")
-        print(f"  Target: {config.target_bits} bits/weight")
-        print(f"  Bit options: {config.bit_options}")
-        print(f"  Clique threshold: {config.clique_threshold}")
+        print(f"  Target       : {config.target_bits} bits/weight")
+        print(f"  Bit options  : {config.bit_options}")
+        print(f"  Clique thresh: {config.clique_threshold}")
+        print(f"  Domain       : {calibration_domain}")
         print(f"{'='*60}\n")
 
-    # ── Handle tied embeddings ───────────────────────────────────────────────
+    # Handle tied embeddings
     if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
         warnings.warn(
-            "[CSAQ] Model has tie_word_embeddings=True.  Untying to preserve "
-            "memory integrity during quantisation.",
+            "[CSAQ] tie_word_embeddings=True detected. Untying for safe quantisation.",
             stacklevel=2,
         )
         model.config.tie_word_embeddings = False
@@ -498,9 +472,11 @@ def quantize(
             pass
 
     device = next(model.parameters()).device
-    calib = _prepare_calib_data(calib_data, model, str(device))
+    calib = _prepare_calib_data(
+        calib_data, model, str(device), tokenizer=tokenizer, seq_len=seq_len
+    )
 
-    # ── Phase 1 & 2: Profiling ───────────────────────────────────────────────
+    # Phase 1+2
     if verbose:
         print("[CSAQ] Phase 1+2: Causal salience profiling & clique discovery")
     profiler = CausalProfiler(model, config)
@@ -508,9 +484,9 @@ def quantize(
 
     cliques_count = sum(len(v) for v in cliques.values())
     if verbose:
-        print(f"[CSAQ] Discovered {cliques_count} weight cliques across {len(cliques)} layers.\n")
+        print(f"[CSAQ] Discovered {cliques_count} cliques across {len(cliques)} layers.\n")
 
-    # ── Phase 3a: Budget solver ──────────────────────────────────────────────
+    # Phase 3a
     if verbose:
         print("[CSAQ] Phase 3a: Bit-budget constraint solving")
     budget, tier_stats, actual_bits = solve_clique_budget(salience, cliques, config)
@@ -521,7 +497,7 @@ def quantize(
             print(f"  {tier}: {count:,} elements ({pct:.1f}%)")
         print()
 
-    # ── Phase 3b: Apply & pack ───────────────────────────────────────────────
+    # Phase 3b
     if verbose:
         print("[CSAQ] Phase 3b: Applying quantisation & packing weights")
     causal_map = apply_csaq(model, budget, salience, config, verbose=verbose)
@@ -537,4 +513,5 @@ def quantize(
         "actual_bits": actual_bits,
         "cliques_count": cliques_count,
         "elapsed_s": elapsed,
+        "calibration_domain": calibration_domain,
     }
