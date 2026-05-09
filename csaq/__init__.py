@@ -1,53 +1,59 @@
 """
 csaq — Causal Salience-Aware Quantization
-====================================
-pip install csaq-quant
+==========================================
 
-Usage:
-    from csaq import quantize, CSAQConfig
+Quick start::
 
-    config = CSAQConfig(target_bits=4.0)
-    model, info = quantize(model, calib_data, config=config)
+    from csaq import quantize, CSAQConfig, build_calibration_data
+
+    config = CSAQConfig(target_bits=4.0, bit_options=[4, 8, 16])
+    calib  = build_calibration_data(tokenizer, n=64)
+    model, info = quantize(model, calib, config=config)
 
     # Self-Speculative Decoding
     from csaq import CSAQInferenceEngine
     engine = CSAQInferenceEngine(model, info["causal_map"], tokenizer)
-    output, report = engine.generate_speculative(input_ids, lookahead=4)
+    output, report = engine.generate(input_ids, max_new_tokens=256,
+                                      speculative=True, lookahead=4)
+    print(report.summary())
 """
 
 from .config import CSAQConfig
 from .core import (
-    quantize,
     CausalProfiler,
-    solve_clique_budget,
     apply_csaq,
+    quantize,
+    solve_clique_budget,
 )
-
-from .inference import (
-    CSAQInferenceEngine,
-    SpeculativeReport,
-)
-
+from .inference import CSAQInferenceEngine, SpeculativeReport
+from .kernels import CSAQLinear, QuantizedWeight
 from .utils import (
     build_calibration_data,
     compute_perplexity,
-    generate_csaq_report,
     export_csaq_model,
+    generate_csaq_report,
 )
 
-__version__ = "0.4.1"
-__author__  = "Omdeep Borkar"
-__all__     = [
+__version__ = "0.5.0"
+__author__ = "Omdeep Borkar"
+__email__ = "omdeepborkar@gmail.com"
+
+__all__ = [
+    # Core pipeline
     "quantize",
     "CSAQConfig",
     "CausalProfiler",
     "solve_clique_budget",
     "apply_csaq",
+    # Inference
     "CSAQInferenceEngine",
     "SpeculativeReport",
+    # Kernels
+    "CSAQLinear",
+    "QuantizedWeight",
+    # Utils
     "build_calibration_data",
     "compute_perplexity",
     "generate_csaq_report",
     "export_csaq_model",
 ]
-
