@@ -45,7 +45,10 @@ def test_clique_threshold_bounds() -> None:
     with pytest.raises(ValueError, match="clique_threshold"):
         CSAQConfig(clique_threshold=-0.1)
     with pytest.raises(ValueError, match="clique_threshold"):
-        CSAQConfig(clique_threshold=1.5)
+        CSAQConfig(clique_threshold=2.5)
+    # Values > 1.0 but <= 2.0 are valid (ablation mode)
+    cfg = CSAQConfig(clique_threshold=1.5)
+    assert cfg.clique_threshold == 1.5
 
 
 def test_protection_floor_bounds() -> None:

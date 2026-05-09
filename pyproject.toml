@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "csaq-quant"
-version = "0.5.1"
+version = "0.5.9"
 description = "Causal Salience-Aware Quantization — gradient×activation informed, clique-graph LLM weight quantization with self-speculative decoding"
 readme = "README.md"
 license = { text = "MIT" }

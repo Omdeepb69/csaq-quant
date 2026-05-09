@@ -94,12 +94,12 @@ def quantize_per_channel(
     if bits == 16:
         # fp16 — no packing, just dtype cast stored in uint8 view
         fp16 = W.detach().to(torch.float16)
-        dummy_scale = torch.ones(W.shape[0], dtype=torch.float32)
-        dummy_zp = torch.zeros(W.shape[0], dtype=torch.int32)
+        dummy_scale = torch.ones(W.shape[0], dtype=torch.float32, device=W.device)
+        dummy_zp = torch.zeros(W.shape[0], dtype=torch.int32, device=W.device)
         return QuantizedWeight(
-            qdata=fp16.view(torch.uint8),
-            scales=dummy_scale,
-            zero_points=dummy_zp,
+            qdata=fp16.view(torch.uint8).cpu(),
+            scales=dummy_scale.cpu(),
+            zero_points=dummy_zp.cpu(),
             bits=16,
             rows=W.shape[0],
             cols=W.shape[1],
@@ -117,9 +117,9 @@ def quantize_per_channel(
         scales, zero_points = _compute_scale_zp(w_min, w_max, bits)
         Wq = _quantize_rows(W32, scales.unsqueeze(1), zero_points.unsqueeze(1), bits)
         return QuantizedWeight(
-            qdata=_pack(Wq, bits),
-            scales=scales,
-            zero_points=zero_points,
+            qdata=_pack(Wq, bits).cpu(),
+            scales=scales.cpu(),
+            zero_points=zero_points.cpu(),
             bits=bits,
             rows=rows,
             cols=cols,
@@ -182,12 +182,12 @@ def quantize_shared_scale(
     """
     if bits == 16:
         fp16 = W.detach().to(torch.float16)
-        dummy_scale = torch.ones(W.shape[0], dtype=torch.float32)
-        dummy_zp = torch.zeros(W.shape[0], dtype=torch.int32)
+        dummy_scale = torch.ones(W.shape[0], dtype=torch.float32, device=W.device)
+        dummy_zp = torch.zeros(W.shape[0], dtype=torch.int32, device=W.device)
         return QuantizedWeight(
-            qdata=fp16.view(torch.uint8),
-            scales=dummy_scale,
-            zero_points=dummy_zp,
+            qdata=fp16.view(torch.uint8).cpu(),
+            scales=dummy_scale.cpu(),
+            zero_points=dummy_zp.cpu(),
             bits=16,
             rows=W.shape[0],
             cols=W.shape[1],
@@ -223,9 +223,9 @@ def quantize_shared_scale(
         zp_bc = zp.expand(rows).contiguous()
 
         return QuantizedWeight(
-            qdata=_pack(Wq, bits),
-            scales=scales_bc,
-            zero_points=zp_bc,
+            qdata=_pack(Wq, bits).cpu(),
+            scales=scales_bc.cpu(),
+            zero_points=zp_bc.cpu(),
             bits=bits,
             rows=rows,
             cols=cols,
@@ -257,9 +257,9 @@ def quantize_shared_scale(
         zp_bc = zp.unsqueeze(0).expand(rows, -1).contiguous()
 
         return QuantizedWeight(
-            qdata=_pack(Wq, bits),
-            scales=scales_bc,
-            zero_points=zp_bc,
+            qdata=_pack(Wq, bits).cpu(),
+            scales=scales_bc.cpu(),
+            zero_points=zp_bc.cpu(),
             bits=bits,
             rows=rows,
             cols=cols,
@@ -394,10 +394,11 @@ class CSAQLinear(nn.Module):
             bias=linear.bias,
         )
 
+        device = W.device
         # Allocate output storage in fp32, then pack at end
         W_reconstructed = torch.zeros_like(W)
-        all_scales = torch.ones(out_f, dtype=torch.float32)
-        all_zp = torch.zeros(out_f, dtype=torch.int32)
+        all_scales = torch.ones(out_f, dtype=torch.float32, device=device)
+        all_zp = torch.zeros(out_f, dtype=torch.int32, device=device)
 
         covered: set[int] = set()
         for c in clique_list:
@@ -405,17 +406,17 @@ class CSAQLinear(nn.Module):
             bits: int = c["bits"]
             leader: int = c["leader"]
 
-            if bits == 16:
-                W_reconstructed[rows] = W[rows]
-                # Scales not meaningful for fp16 passthrough
-                continue
+            # All rows in a layer must use the same bit-width because
+            # CSAQLinear stores one packed buffer at dominant_bits.
+            # Mixed bit-widths would corrupt the pack/unpack roundtrip.
+            effective_bits = dominant_bits
 
-            qw = quantize_shared_scale(W[rows], W[leader], bits, layer.group_size)
-            W_reconstructed[rows] = qw.dequantize()
+            qw = quantize_shared_scale(W[rows], W[leader], effective_bits, layer.group_size)
+            W_reconstructed[rows] = qw.dequantize().to(device)
 
             # Store per-row scale/zp (simplified: use leader scale for all in clique)
-            sc = qw.scales[:len(rows)]
-            zp_ = qw.zero_points[:len(rows)]
+            sc = qw.scales[:len(rows)].to(device)
+            zp_ = qw.zero_points[:len(rows)].to(device)
             all_scales[rows] = sc
             all_zp[rows] = zp_
             covered.update(rows)
@@ -424,9 +425,9 @@ class CSAQLinear(nn.Module):
         uncovered = [i for i in range(out_f) if i not in covered]
         if uncovered:
             qw = quantize_per_channel(W[uncovered], dominant_bits, layer.group_size)
-            W_reconstructed[uncovered] = qw.dequantize()
-            all_scales[uncovered] = qw.scales[:len(uncovered)]
-            all_zp[uncovered] = qw.zero_points[:len(uncovered)]
+            W_reconstructed[uncovered] = qw.dequantize().to(device)
+            all_scales[uncovered] = qw.scales[:len(uncovered)].to(device)
+            all_zp[uncovered] = qw.zero_points[:len(uncovered)].to(device)
 
         # Pack the reconstructed matrix
         Wq_int = _float_to_int(W_reconstructed, all_scales, all_zp, dominant_bits)
@@ -448,15 +449,23 @@ class CSAQLinear(nn.Module):
 
     def _get_weight_fp32(self) -> torch.Tensor:
         """Unpack stored qdata back to fp32 for the matmul."""
+        dev = self.weight_scales.device
         if self.bits == 16:
-            return self.weight_packed.view(torch.float16).float().view(
-                self.out_features, self.in_features
+            return (
+                self.weight_packed.view(torch.float16)
+                .float()
+                .view(self.out_features, self.in_features)
             )
-        Wq = _unpack(self.weight_packed, self.bits, self.out_features, self.in_features)
-        # dequantize: W ≈ (Wq - zp) * scale  (per-channel)
+
+        Wq = _unpack(
+            self.weight_packed, self.bits, self.out_features, self.in_features
+        ).to(dev)
         scale = self.weight_scales.unsqueeze(1).float()
         zp = self.weight_zp.unsqueeze(1).float()
-        return (Wq.float() - zp) * scale
+        W = (Wq.float() - zp) * scale
+        # Clamp to prevent fp16 overflow in downstream matmul
+        W = torch.nan_to_num(W, nan=0.0, posinf=65504.0, neginf=-65504.0)
+        return W
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         W = self._get_weight_fp32().to(x.dtype)

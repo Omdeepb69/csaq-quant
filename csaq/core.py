@@ -185,9 +185,14 @@ class CausalProfiler:
         except ImportError:
             data_iter = enumerate(calib_data)  # type: ignore[assignment]
 
+        first_device = next(self.model.parameters()).device
+
         for i, batch in data_iter:
             actual_batches += 1
+            # Move batch to the model's first device (needed for multi-GPU device_map)
+            batch = {k: v.to(first_device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             labels = batch.get("labels", batch.get("input_ids"))
+            
             try:
                 out = self.model(**batch, labels=labels)
                 out.loss.backward()
@@ -269,6 +274,10 @@ class CausalProfiler:
                     continue
                 similar = (jaccard[i] >= threshold).nonzero(as_tuple=False).flatten()
                 clique = [idx.item() for idx in similar if not visited[idx]]
+                # Ensure the seed channel is always included (handles
+                # threshold > 1.0 ablation where no pair meets threshold)
+                if i not in clique:
+                    clique.insert(0, i)
                 if clique:
                     layer_cliques.append(clique)
                     visited[torch.tensor(clique, dtype=torch.long)] = True
@@ -384,7 +393,10 @@ def apply_csaq(
         row_sal = salience[mod_name].sum(dim=1)
         n_out = module.out_features
         n_protect = max(1, int(config.protection_floor * n_out))
-        top_rows = row_sal.topk(n_protect).indices.sort().values
+        
+        mod_device = next(module.parameters(), module.weight_packed).device
+        top_rows   = row_sal.topk(n_protect).indices.sort().values
+        top_rows   = top_rows.to(mod_device)
 
         W_fp32 = module._get_weight_fp32()
         fp16_backup = W_fp32[top_rows].to(torch.float16).detach().contiguous()

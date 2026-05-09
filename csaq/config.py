@@ -32,9 +32,10 @@ class CSAQConfig(PretrainedConfig):
             PyTorch int8/uint8 packed storage.  1-bit is intentionally
             removed: sign-only quantisation on LLMs causes catastrophic
             accuracy loss and has no matching runtime kernel.
-        clique_threshold: Jaccard similarity threshold ``[0, 1]`` above which
+        clique_threshold: Jaccard similarity threshold ``[0, 2]`` above which
             two output channels are considered co-activated and grouped into
-            the same clique.  Higher = fewer, larger cliques.
+            the same clique.  Higher = fewer, larger cliques.  Values > 1.0
+            force singleton cliques (ablation mode).
         auto_scale_memory: If ``True`` (default), CSAQ scales calibration
             batch count based on available CPU RAM to avoid OOM.
         speculative_lookahead: Number of draft tokens generated per
@@ -101,8 +102,11 @@ class CSAQConfig(PretrainedConfig):
             )
 
         # ── Threshold / fraction validation ──────────────────────────────────
-        if not (0.0 <= clique_threshold <= 1.0):
-            raise ValueError("[CSAQConfig] clique_threshold must be in [0, 1].")
+        if not (0.0 <= clique_threshold <= 2.0):
+            raise ValueError(
+                "[CSAQConfig] clique_threshold must be in [0, 2]. "
+                "Values > 1.0 force singleton cliques (ablation mode)."
+            )
         if not (0.0 <= protection_floor < 1.0):
             raise ValueError("[CSAQConfig] protection_floor must be in [0, 1).")
 

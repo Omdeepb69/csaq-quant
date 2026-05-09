@@ -138,6 +138,11 @@ def compute_perplexity(
     if not eval_texts:
         raise ValueError("[CSAQ] eval_texts is empty.")
 
+    # Auto-detect device if device="cpu" but model is on cuda
+    first_device = next(model.parameters()).device
+    if str(first_device) != "cpu" and device == "cpu":
+        device = str(first_device)
+
     text = "\n\n".join(eval_texts)
     enc = tokenizer(text, return_tensors="pt")
     inp = enc.input_ids[:, :max_tokens].to(device)

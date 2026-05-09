@@ -38,7 +38,7 @@ from transformers import AutoModelForCausalLM
 
 AutoModelForCausalLM.register(CSAQConfig, CSAQModelForCausalLM)
 
-__version__ = "0.5.1"
+__version__ = "0.5.9"
 __author__ = "Omdeep Borkar"
 __email__ = "omdeepborkar@gmail.com"
 
